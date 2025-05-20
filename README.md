@@ -112,7 +112,14 @@ flowchart TB
 
 *   **Service Registration:** Register MCP services via JSON files or the web UI/API.
 *   **Web UI:** Manage services, view status, and monitor health through a web interface.
-*   **Authentication:** Secure login system for the web UI and API access.
+*   **OAuth 2.1 Authentication:**
+    *   Standards-compliant OAuth 2.1 authorization code flow with PKCE
+    *   Support for multiple identity providers (AWS Cognito, Okta, and others)
+    *   Fine-grained scope-based access control
+    *   Secure session management with proper token handling
+*   **MCP Protocol Support:**
+    *   Server-Sent Events (SSE) transport via `/api/execute/{service}` endpoint
+    *   StreamableHTTP transport via `/api/streamable/{service}` endpoint
 *   **Health Checks:**
     *   Periodic background checks for enabled services (checks `/sse` endpoint).
     *   Manual refresh trigger via UI button or API endpoint.
@@ -317,12 +324,94 @@ See the full API spec [here](docs/registry_api.md).
 
 *(Authentication via session cookie is required for most non-login routes)*
 
+## OAuth 2.1 Authentication
+
+MCP Gateway now supports OAuth 2.1 authentication for secure access to the gateway and its services.
+
+```mermaid
+sequenceDiagram
+    participant Client as MCP Client
+    participant Gateway as MCP Gateway
+    participant IdP as Identity Provider
+    participant Server as MCP Server
+
+    Client->>Gateway: 1. Request tool execution
+    Gateway->>Gateway: 2. Check authentication
+    alt Not authenticated
+        Gateway->>Client: 3. Redirect to /oauth/login
+        Client->>Gateway: 4. Request /oauth/login
+        Gateway->>IdP: 5. Redirect to IdP with PKCE
+        Client->>IdP: 6. User authentication
+        IdP->>Gateway: 7. Authorization code
+        Gateway->>IdP: 8. Exchange code for tokens
+        Gateway->>Gateway: 9. Validate tokens, extract scopes
+        Gateway->>Client: 10. Set session cookie
+    end
+    Client->>Gateway: 11. Request with auth cookie
+    Gateway->>Gateway: 12. Verify scopes
+    alt Authorized
+        Gateway->>Server: 13. Proxy to MCP Server
+        Server->>Gateway: 14. Server response
+        Gateway->>Client: 15. Return response
+    else Not authorized
+        Gateway->>Client: Return 403 Forbidden
+    end
+```
+
+### Key Features
+
+- Standards-compliant OAuth 2.1 authorization code flow with PKCE
+- Multiple identity provider support (AWS Cognito, Okta, and others)
+- Fine-grained scope-based access control
+- Support for both SSE and StreamableHTTP transport protocols
+- Configurable through environment variables or config files
+
+### Setting up OAuth Authentication
+
+To enable OAuth 2.1 authentication:
+
+1. **Configure Environment Variables:**
+   - Set `MCP_AUTH_ENABLED=true`
+   - Generate a secure `SECRET_KEY`
+   - Configure provider-specific settings
+
+2. **Docker Run Command Example:**
+
+```bash
+docker run -p 80:80 -p 443:443 -p 7860:7860 \
+  -e ADMIN_USER=$ADMIN_USER \
+  -e ADMIN_PASSWORD=$ADMIN_PASSWORD \
+  -e POLYGON_API_KEY=$POLYGON_API_KEY \
+  -e SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))') \
+  -e MCP_AUTH_ENABLED=true \
+  -e MCP_AUTH_PROVIDER_TYPE=$PROVIDER_TYPE \
+  # Add your provider-specific environment variables here
+  -v /var/log/mcp-gateway:/app/logs \
+  -v /opt/mcp-gateway/servers:/app/registry/servers \
+  --name mcp-gateway-container mcp-gateway
+```
+
+See the [OAuth Documentation](docs/oauth.md) for detailed configuration options for AWS Cognito, Okta, and other providers.
+
+### Transport Protocol Support
+
+MCP Gateway supports both transport protocols defined in the MCP specification:
+
+- **Server-Sent Events (SSE)**: Access via `/api/execute/{service}` endpoint
+- **StreamableHTTP**: Access via `/api/streamable/{service}` endpoint
+
+### For More Information
+
+For comprehensive documentation on OAuth setup, transport protocols, scope-based access control, and more, see:
+
+- [OAuth Documentation](docs/oauth.md)
+- [API Documentation](docs/registry_api.md)
+
 ## Roadmap
 
 1. Store the server information in persistent storage.
-1. Add OAUTH 2.1 support to Gateway and Registry.
-1. Use GitHub API to retrieve information (license, programming language etc.) about MCP servers.
-1. Add option to deploy MCP servers.
+2. Use GitHub API to retrieve information (license, programming language etc.) about MCP servers.
+3. Add option to deploy MCP servers.
 
 ## License
 
