@@ -46,16 +46,47 @@ for subdir in $subdirs; do
     
     # Check if JSON file exists
     if [ -f "$json_file" ]; then
-        # Extract proxy_pass_url from the JSON file
-        proxy_pass_url=$(grep -o '"proxy_pass_url": *"[^"]*"' "$json_file" | sed 's/"proxy_pass_url": *"\([^"]*\)"/\1/')
+        # Check for environment variables with server-specific port assignments
+        case "$server_name" in
+            "currenttime")
+                if [[ -n "$CURRENT_TIME_PORT" ]]; then
+                    port=$CURRENT_TIME_PORT
+                    echo "Using environment-specified port $port for $server_name"
+                fi
+                ;;
+            "fininfo")
+                if [[ -n "$FININFO_PORT" ]]; then
+                    port=$FININFO_PORT
+                    echo "Using environment-specified port $port for $server_name"
+                fi
+                ;;
+            "mcpgw")
+                if [[ -n "$MCPGW_PORT" ]]; then
+                    port=$MCPGW_PORT
+                    echo "Using environment-specified port $port for $server_name"
+                fi
+                ;;
+            "realserverfaketools")
+                if [[ -n "$REALSERVER_PORT" ]]; then
+                    port=$REALSERVER_PORT
+                    echo "Using environment-specified port $port for $server_name"
+                fi
+                ;;
+        esac
         
-        # Check if proxy_pass_url contains a port number
-        if [[ $proxy_pass_url =~ :[0-9]+/ ]]; then
-            # Extract the port number
-            port=$(echo "$proxy_pass_url" | sed -E 's/.*:([0-9]+)\/.*/\1/')
-        elif [[ $proxy_pass_url == https://* ]]; then
-            # If URL is HTTPS and no port specified, use 443
-            port=443
+        # If no environment port was specified, extract from proxy_pass_url
+        if [[ -z "$port" ]]; then
+            # Extract proxy_pass_url from the JSON file
+            proxy_pass_url=$(grep -o '"proxy_pass_url": *"[^"]*"' "$json_file" | sed 's/"proxy_pass_url": *"\([^"]*\)"/\1/')
+            
+            # Check if proxy_pass_url contains a port number
+            if [[ $proxy_pass_url =~ :[0-9]+/ ]]; then
+                # Extract the port number
+                port=$(echo "$proxy_pass_url" | sed -E 's/.*:([0-9]+)\/.*/\1/')
+            elif [[ $proxy_pass_url == https://* ]]; then
+                # If URL is HTTPS and no port specified, use 443
+                port=443
+            fi
         fi
     fi
     

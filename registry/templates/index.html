@@ -174,6 +174,15 @@
         .search-bar button:hover {
             background-color: var(--card-border); /* Darken slightly on hover */
         }
+        
+        /* User scopes display */
+        .user-scopes {
+            font-size: 0.8em;
+            color: var(--text-color);
+            opacity: 0.7;
+            margin-left: 8px;
+            font-style: italic;
+        }
         .search-bar input[type="search"] {
             background-color: var(--input-bg);
             color: var(--input-text);
@@ -1646,35 +1655,44 @@
                     body: new URLSearchParams(formData) // Send as x-www-form-urlencoded
                 });
 
-                const responseData = await response.json(); // Always try to parse JSON
-
                 if (!response.ok) {
-                    // Log error from backend response if possible
-                    const errorMsg = responseData.detail || `HTTP error ${response.status}`;
-                    console.error(`Error toggling service ${servicePath}: ${errorMsg}`);
-                    alert(`Error toggling service: ${errorMsg}`);
-                    // Revert checkbox state on error? Maybe not, let WS handle the authoritative state.
+                    // Handle HTTP error responses
+                    console.error(`HTTP error ${response.status} while toggling service ${servicePath}`);
+                    
+                    // Try to get error details if available in JSON format
+                    try {
+                        const errorData = await response.json();
+                        const errorMsg = errorData.detail || `HTTP error ${response.status}`;
+                        console.error(`Error details: ${errorMsg}`);
+                        alert(`Error toggling service: ${errorMsg}`);
+                    } catch (jsonError) {
+                        // If response is not JSON, just show HTTP status
+                        console.error(`Error response was not valid JSON: ${jsonError}`);
+                        alert(`Error toggling service: HTTP ${response.status}`);
+                    }
                 } else {
-                    console.log(`Toggle request successful for ${servicePath}. Backend response:`, responseData);
-                    // Backend will trigger WebSocket update, which calls updateServiceDisplay
-                    // updateServiceDisplay will hide spinner, set correct checkbox state, label, etc.
+                    // Handle successful response
+                    try {
+                        const responseData = await response.json();
+                        console.log(`Toggle request successful for ${servicePath}. Backend response:`, responseData);
+                        // Backend will trigger WebSocket update, which calls updateServiceDisplay
+                        // updateServiceDisplay will hide spinner, set correct checkbox state, label, etc.
+                    } catch (jsonError) {
+                        console.warn(`Success response was not valid JSON: ${jsonError}`);
+                        console.log(`Toggle request completed for ${servicePath} but response was not JSON.`);
+                    }
                 }
-
             } catch (error) {
                 console.error(`Network or fetch error toggling service ${servicePath}:`, error);
                 alert(`Failed to send toggle request: ${error}`);
-                // If fetch fails completely, maybe revert spinner/disable state here?
-                // But relying on WS might still be better for consistency.
             } finally {
-                // Re-enable the checkbox ONLY IF the WS hasn't already done so
-                // updateServiceDisplay handles the definitive enabling/disabling and check state
-                // We might remove this re-enable here and solely rely on updateServiceDisplay.
-                // Let's test with it first. If double-enabling causes issues, remove this.
-                // Checkbox might still be disabled if WS update came through quickly.
-                // if (checkboxElement.disabled) {
-                //     checkboxElement.disabled = false;
-                // }
-                // Let's rely on updateServiceDisplay to manage the final enabled state.
+                // Always try to reset UI state regardless of success/failure
+                if (spinner) {
+                    spinner.style.display = 'none';
+                }
+                if (checkboxElement.disabled) {
+                    checkboxElement.disabled = false;
+                }
             }
         }
 
@@ -2156,7 +2174,18 @@
             <button id="register-server-button" class="secondary-button" style="margin-right: 10px; padding: 8px 16px; font-weight: 600; border-radius: 8px;">Register Server</button>
             {% endif %}
             <button id="theme-toggle" class="theme-toggle-button" title="Toggle Theme">🌙</button>
-            <span class="user-display">User: {{ username }}</span>
+            <span class="user-display">
+                Logged in as <strong>{{ username }}</strong>
+                {% if user_scopes %}
+                <span class="user-scopes" data-scopes="{{ ','.join(user_scopes) }}">
+                    [{{ ', '.join(user_scopes) }}]
+                </span>
+                {% elif request.state.user and request.state.user.scopes %}
+                <span class="user-scopes" data-scopes="{{ ','.join(request.state.user.scopes) }}">
+                    [{{ ', '.join(request.state.user.scopes) }}]
+                </span>
+                {% endif %}
+            </span>
             <form action="/logout" method="post" style="display: inline;">
                 <button type="submit" class="logout-button">Logout</button>
             </form>
@@ -2493,20 +2522,40 @@
                         body: new URLSearchParams(formData) // Send as x-www-form-urlencoded
                     });
 
-                    const responseData = await response.json(); // Always try to parse JSON
-
                     if (!response.ok) {
-                        // Log error from backend response if possible
-                        const errorMsg = responseData.detail || `HTTP error ${response.status}`;
-                        console.error(`Error toggling service ${servicePath}: ${errorMsg}`);
-                        alert(`Error toggling service: ${errorMsg}`);
+                        // Handle HTTP error responses
+                        console.error(`HTTP error ${response.status} while toggling service ${servicePath}`);
+                        
+                        // Try to get error details if available in JSON format
+                        try {
+                            const errorData = await response.json();
+                            const errorMsg = errorData.detail || `HTTP error ${response.status}`;
+                            console.error(`Error details: ${errorMsg}`);
+                            alert(`Error toggling service: ${errorMsg}`);
+                        } catch (jsonError) {
+                            // If response is not JSON, just show HTTP status
+                            console.error(`Error response was not valid JSON: ${jsonError}`);
+                            alert(`Error toggling service: HTTP ${response.status}`);
+                        }
                     } else {
-                        console.log(`Toggle request successful for ${servicePath}. Backend response:`, responseData);
+                        // Handle successful response
+                        try {
+                            const responseData = await response.json();
+                            console.log(`Toggle request successful for ${servicePath}. Backend response:`, responseData);
+                        } catch (jsonError) {
+                            console.warn(`Success response was not valid JSON: ${jsonError}`);
+                            console.log(`Toggle request completed for ${servicePath} but response was not JSON.`);
+                        }
                     }
-
                 } catch (error) {
                     console.error(`Network or fetch error toggling service ${servicePath}:`, error);
                     alert(`Failed to send toggle request: ${error}`);
+                } finally {
+                    // Always re-enable the checkbox and hide spinner after request completes
+                    if (spinner) {
+                        spinner.style.display = 'none';
+                    }
+                    checkboxElement.disabled = false;
                 }
             }
 
