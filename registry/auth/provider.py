@@ -6,6 +6,7 @@ the MCP Python SDK, delegating authentication to external identity providers.
 """
 import json
 import time
+import os
 import secrets
 import urllib.parse
 from typing import Dict, List, Optional, Any, Tuple
@@ -409,12 +410,19 @@ class ConfigurableIdPAdapter(OAuthAuthorizationServerProvider[MCP_AuthCode, Refr
         
         logger.info(f"Making token request to {self.idp_settings.token_url}")
         
+        # Use a reasonably short timeout to prevent delays for users
+        # Default is 10 seconds, which is generous but prevents very long hangs
+        timeout_seconds = int(os.environ.get("MCP_AUTH_IDP_TIMEOUT", "10"))
+        
+        logger.info(f"Making token request with {timeout_seconds}s timeout to {self.idp_settings.token_url}")
+        
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.post(
                     self.idp_settings.token_url,
                     data=token_params,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"}
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=timeout_seconds  # Add timeout to prevent delays
                 )
                 
                 # Log response status and headers for debugging
@@ -904,11 +912,16 @@ class CognitoOAuthProvider(ConfigurableIdPAdapter):
         
         try:
             # Use HTTPX for token exchange since pycognito doesn't directly support PKCE with code_verifier
+            # Use a short timeout to prevent long user-visible delays
+            timeout_seconds = int(os.environ.get("MCP_AUTH_IDP_TIMEOUT", "10"))
+            logger.info(f"Making Cognito token request with {timeout_seconds}s timeout")
+            
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     self.settings.idp_settings.token_url,
                     data=token_params,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"}
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=timeout_seconds  # Add timeout to prevent delays
                 )
                 
                 if response.status_code != 200:

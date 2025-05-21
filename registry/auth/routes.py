@@ -344,13 +344,18 @@ async def oauth_callback(request: Request, code: str = None, state: str = None):
             session_cookie_name = "mcp_gateway_session"
             session_max_age = 60 * 60 * 8  # 8 hours
             
-            # Create session data with actual username and groups
+            # Create session data with actual username, groups, and provider type
             session_data = {
                 "username": user_info['name'],  # Use the actual username from token claims
                 "oauth_code": auth_code,
-                "is_oauth": True,
-                "email": user_info.get('email', '')
+                "is_oauth": True,  # Make sure this is explicitly set to True
+                "email": user_info.get('email', ''),
+                "provider_type": _settings.idp_settings.provider_type,  # Store the provider type for logout
+                "login_time": datetime.now().isoformat(),  # Add timestamp for debugging
+                "auth_method": "oauth"  # Add redundant auth method indicator for safety
             }
+            
+            logger.info(f"Creating OAuth session with provider: {_settings.idp_settings.provider_type}")
             
             # Store Cognito groups in session if available
             if 'cognito:groups' in id_token_claims and isinstance(id_token_claims['cognito:groups'], list):

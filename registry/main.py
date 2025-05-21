@@ -15,6 +15,7 @@ import re
 from registry.auth.settings import AuthSettings
 from itsdangerous import URLSafeTimedSerializer
 import uvicorn
+import time
 
 import faiss
 import numpy as np
@@ -48,6 +49,11 @@ import logging
 
 # Import OAuth integration
 from registry.auth.integration import integrate_oauth
+
+# Lightweight session invalidation using session timestamps
+# Instead of storing all invalidated sessions, we track logout times
+SESSION_LOGOUT_TIMES: Dict[str, float] = {}
+MAX_LOGOUT_ENTRIES = 1000  # Keep only recent logout times
 
 # --- OAuth 2.1 Integration --- START
 from registry.auth.middleware import SessionUser
@@ -624,6 +630,41 @@ logger.info(f"OAuth 2.1 integration setup: {'ENABLED' if oauth_provider else 'DI
 
 # -- Authentication Helper Functions --
 
+def get_session_fingerprint(session_data: dict) -> str:
+    """Generate a lightweight session fingerprint using username and login time only."""
+    username = session_data.get("username", "")
+    login_time = session_data.get("login_time", "")
+    return f"{username}:{login_time}"
+
+def cleanup_logout_times():
+    """Clean up old logout times to prevent memory leaks."""
+    global SESSION_LOGOUT_TIMES
+    if len(SESSION_LOGOUT_TIMES) > MAX_LOGOUT_ENTRIES:
+        # Keep only the most recent entries
+        sorted_items = sorted(SESSION_LOGOUT_TIMES.items(), key=lambda x: x[1])
+        SESSION_LOGOUT_TIMES = dict(sorted_items[-MAX_LOGOUT_ENTRIES//2:])
+
+def is_session_logged_out(session_data: dict) -> bool:
+    """Check if session was logged out after its creation time."""
+    fingerprint = get_session_fingerprint(session_data)
+    logout_time = SESSION_LOGOUT_TIMES.get(fingerprint)
+    
+    if logout_time is None:
+        return False
+    
+    # Parse session login time
+    login_time_str = session_data.get("login_time", "")
+    if not login_time_str:
+        return False
+    
+    try:
+        from datetime import datetime
+        login_time = datetime.fromisoformat(login_time_str.replace('Z', '+00:00'))
+        login_timestamp = login_time.timestamp()
+        return logout_time > login_timestamp
+    except (ValueError, AttributeError):
+        return False
+
 def get_current_user(request: Request, session: str = Cookie(None)) -> str:
     """Get the current user from session cookie, or return 'anonymous'."""
     SECRET_KEY = os.environ.get("SECRET_KEY", "insecure-default-key-for-testing-only")
@@ -666,6 +707,12 @@ def get_current_user(request: Request, session: str = Cookie(None)) -> str:
         s = URLSafeTimedSerializer(SECRET_KEY)
         MAX_AGE = int(os.environ.get("SESSION_EXPIRATION_SECONDS", default_session_expr))
         data = s.loads(session, max_age=MAX_AGE)
+        
+        # Check if this session has been logged out
+        if is_session_logged_out(data):
+            fingerprint = get_session_fingerprint(data)
+            logger.warning(f"Session {fingerprint} was logged out after creation")
+            raise HTTPException(status_code=401, detail="Session has been logged out")
         
         # If OAuth session
         if data.get("is_oauth", False):
@@ -781,161 +828,116 @@ async def login(
         )
 
 
+def get_idp_logout_url(provider_type: str, request: Request) -> str:
+    """Generate IdP logout URL in a provider-agnostic way."""
+    logger.info(f"Generating IdP logout URL for provider: {provider_type}")
+    try:
+        auth_settings = AuthSettings()
+        logger.info(f"Auth settings - enabled: {auth_settings.enabled}, has idp_settings: {auth_settings.idp_settings is not None}")
+        
+        if not (auth_settings.enabled and auth_settings.idp_settings):
+            logger.warning("Auth not enabled or no IdP settings available")
+            return None
+            
+        timestamp = int(datetime.now(timezone.utc).timestamp())
+        scheme = request.url.scheme or "http"
+        host = request.headers.get('host', 'localhost:7860')
+        return_uri = f"{scheme}://{host}/login?t={timestamp}&signed_out=true&complete=true"
+        logger.info(f"Generated return URI: {return_uri}")
+        
+        if provider_type == "cognito":
+            client_id = auth_settings.idp_settings.client_id
+            cognito_domain = os.environ.get("MCP_AUTH_COGNITO_DOMAIN")
+            logger.info(f"Cognito config - client_id: {client_id is not None}, domain: {cognito_domain}")
+            if cognito_domain and client_id:
+                logout_url = f"https://{cognito_domain}/logout?client_id={client_id}&logout_uri={urllib.parse.quote(return_uri)}"
+                logger.info(f"Generated Cognito logout URL: {logout_url}")
+                return logout_url
+            else:
+                logger.warning("Missing Cognito client_id or domain")
+        # Add other IdP logout URL generation here
+        elif provider_type == "azure":
+            # return azure_logout_url(auth_settings, return_uri)
+            pass
+        elif provider_type == "auth0":
+            # return auth0_logout_url(auth_settings, return_uri)  
+            pass
+        
+    except Exception as e:
+        logger.error(f"Error generating IdP logout URL for {provider_type}: {e}")
+    
+    logger.warning(f"No logout URL generated for provider: {provider_type}")
+    return None
+
 @app.get("/logout")
-async def logout_get(request: Request, session: str = Cookie(None)):
+async def logout_get(request: Request):
     """
-    Log out by clearing the session cookie (GET method).
-    For OAuth sessions, also redirects to IdP logout endpoint to clear provider session.
+    Log out by clearing the session cookie and invalidating the session server-side.
+    Provides IdP logout URLs when available.
     """
+    logger.info("Logout initiated")
+    
     session_cookie_name = "mcp_gateway_session"
     SECRET_KEY = os.environ.get("SECRET_KEY", "insecure-default-key-for-testing-only")
     
-    # First, check if this is an OAuth session
-    is_oauth_session = False
-    session_data = {}
+    # Extract session cookie manually (same approach as get_current_user)
+    session = request.cookies.get(session_cookie_name)
+    logger.info(f"Logout - session cookie present: {session is not None}")
+    if session:
+        logger.info(f"Session cookie value: {session[:50]}...")
+    
+    # Decode session and invalidate server-side
+    provider_type = None
+    username = None
+    session_invalidated = False
+    
     if session:
         try:
             s = URLSafeTimedSerializer(SECRET_KEY)
-            session_data = s.loads(session)
-            is_oauth_session = session_data.get("is_oauth", False)
-            logger.info(f"Logging out user - Session data: {session_data}")
+            session_data = s.loads(session, max_age=None)  # Don't check expiry for logout
+            provider_type = session_data.get("provider_type")
+            username = session_data.get("username")
+            
+            # Invalidate session server-side using lightweight approach
+            fingerprint = get_session_fingerprint(session_data)
+            SESSION_LOGOUT_TIMES[fingerprint] = time.time()
+            session_invalidated = True
+            cleanup_logout_times()  # Clean up if needed
+            
+            logger.info(f"Session logout - User: {username}, Provider: {provider_type}, Fingerprint: {fingerprint}")
         except Exception as e:
             logger.warning(f"Error decoding session during logout: {e}")
     
-    # Add timestamp to prevent caching of the login page after logout
+    # Create base logout response
     timestamp = int(datetime.now(timezone.utc).timestamp())
+    logout_url = f"/login?t={timestamp}&signed_out=true"
     
-    # Default response - always include signed_out parameter to trigger complete client-side cleanup
-    response = RedirectResponse(
-        url=f"/login?t={timestamp}&signed_out=true", 
-        status_code=status.HTTP_303_SEE_OTHER
-    )
+    # Add IdP logout URL if available
+    if provider_type:
+        idp_logout_url = get_idp_logout_url(provider_type, request)
+        logger.info(f"Generated IdP logout URL for {provider_type}: {idp_logout_url}")
+        if idp_logout_url:
+            logout_url += f"&idp_logout={urllib.parse.quote(idp_logout_url)}"
+        logout_url += f"&provider_type={provider_type}"
     
-    # Delete the session cookie with all parameters to ensure complete removal
-    response.delete_cookie(
-        key=session_cookie_name, 
-        path="/", 
-        domain=None,
-        secure=False,
-        httponly=True
-    )
+    logger.info(f"Final logout redirect URL: {logout_url}")
     
-    # Try to clear any other cookies that might be related to authentication
-    for cookie_name in request.cookies:
-        response.delete_cookie(
-            key=cookie_name,
-            path="/",
-            domain=None,
-            secure=False,
-            httponly=True
-        )
+    response = RedirectResponse(url=logout_url, status_code=status.HTTP_303_SEE_OTHER)
     
-    # Add strong cache control headers to prevent browser caching
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, private, max-age=0'
+    # Clear session cookie and add cache control headers
+    response.delete_cookie(key=session_cookie_name, path="/", httponly=True)
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
-    
-    # Set additional headers to kill any browser-cached data
     response.headers['Clear-Site-Data'] = '"cookies", "storage", "cache"'
     
-    # For OAuth sessions, determine the IdP type and redirect to its logout endpoint
-    if is_oauth_session:
-        try:
-            # Get OAuth configuration
-            auth_settings = AuthSettings()
-            
-            # Add timestamp to prevent caching of the login page after logout
-            timestamp = int(datetime.now(timezone.utc).timestamp())
-            
-            if auth_settings.enabled and auth_settings.idp_settings:
-                provider_type = auth_settings.idp_settings.provider_type
-                
-                # Different providers have different logout URLs
-                if provider_type == "cognito":
-                    # Configure Cognito logout URL
-                    client_id = auth_settings.idp_settings.client_id
-                    region = os.environ.get("MCP_AUTH_COGNITO_REGION", "us-east-1")
-                    pool_id_parts = os.environ.get("MCP_AUTH_COGNITO_USER_POOL_ID", "").split('_')
-                    if len(pool_id_parts) == 2:
-                        domain_prefix = f"{pool_id_parts[0]}-{pool_id_parts[1].lower()}"
-                        
-                        # Use a signed-out query parameter to indicate we've truly logged out
-                        # This will be used by the login page to clear browser storage
-                        redirect_uri = urllib.parse.quote(f"http://{request.headers.get('host', 'localhost:7860')}/login?t={timestamp}&signed_out=true")
-                        
-                        # Force global signout to revoke refresh tokens
-                        logout_url = f"https://{domain_prefix}.auth.{region}.amazoncognito.com/logout?client_id={client_id}&logout_uri={redirect_uri}&response_type=code&state={secrets.token_hex(16)}"
-                        logger.info(f"Redirecting to Cognito logout URL: {logout_url}")
-                        # Create a new response with the IdP logout URL
-                        response = RedirectResponse(url=logout_url, status_code=status.HTTP_303_SEE_OTHER)
-                        # Make sure it has the same cookie-clearing settings as the default response
-                        response.delete_cookie(key=session_cookie_name, path="/", domain=None, secure=False, httponly=True)
-                        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, private, max-age=0'
-                        response.headers['Pragma'] = 'no-cache'
-                        response.headers['Expires'] = '0'
-                        response.headers['Clear-Site-Data'] = '"cookies", "storage", "cache"'
-                elif provider_type == "okta":
-                    # Configure Okta logout URL
-                    tenant_url = auth_settings.idp_settings.issuer
-                    # Add timestamp parameter to prevent caching
-                    redirect_uri = urllib.parse.quote(f"http://{request.headers.get('host', 'localhost:7860')}/login?t={timestamp}&signed_out=true")
-                    logout_url = f"{tenant_url}/v2/logout?redirectUri={redirect_uri}"
-                    logger.info(f"Redirecting to Okta logout URL: {logout_url}")
-                    # Create a new response with the IdP logout URL
-                    response = RedirectResponse(url=logout_url, status_code=status.HTTP_303_SEE_OTHER)
-                    # Make sure it has the same cookie-clearing settings as the default response
-                    response.delete_cookie(key=session_cookie_name, path="/", domain=None, secure=False, httponly=True)
-                    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, private, max-age=0'
-                    response.headers['Pragma'] = 'no-cache'
-                    response.headers['Expires'] = '0'
-                    response.headers['Clear-Site-Data'] = '"cookies", "storage", "cache"'
-                # Add more provider types here as needed
-        except Exception as e:
-            logger.error(f"Error configuring IdP logout: {e}", exc_info=True)
-            # Fall back to local logout with timestamp and signed_out flag to prevent caching and clear all storage
-            timestamp = int(datetime.now(timezone.utc).timestamp())
-            login_url = f"/login?t={timestamp}&signed_out=true"
-            response = RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
-            # Make sure we have the full set of cookie and cache-clearing headers
-            response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, private, max-age=0'
-            response.headers['Pragma'] = 'no-cache'
-            response.headers['Expires'] = '0'
-            response.headers['Clear-Site-Data'] = '"cookies", "storage", "cache"'
-    else:
-        # For non-OAuth sessions, add a timestamp and signed_out flag to prevent caching and clear all storage
-        timestamp = int(datetime.now(timezone.utc).timestamp())
-        login_url = f"/login?t={timestamp}&signed_out=true"
-        response = RedirectResponse(url=login_url, status_code=status.HTTP_303_SEE_OTHER)
-        # Make sure we have the full set of cookie and cache-clearing headers
-        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, private, max-age=0'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '0'
-        response.headers['Clear-Site-Data'] = '"cookies", "storage", "cache"'
-    
-    logger.info(f"Logging out user - Method: GET, OAuth: {is_oauth_session}")
+    logger.info(f"Logout completed for user: {username}, server-side invalidation: {session_invalidated}")
     return response
 
 @app.post("/logout")
-async def logout_post(request: Request, session: str = Cookie(None)):
-    """
-    Log out by clearing the session cookie (POST method).
-    For OAuth sessions, also redirects to IdP logout endpoint to clear provider session.
-    """
-    # Most logout requests come through POST because the form in the UI uses method="post"
-    logger.info(f"POST logout requested with session cookie: {session is not None}")
-    
-    # Use the same logout function as GET method to ensure consistent behavior
-    response = await logout_get(request, session)
-    
-    # Double-check that all the necessary headers are set
-    session_cookie_name = "mcp_gateway_session"
-    response.delete_cookie(key=session_cookie_name, path="/", domain=None, secure=False, httponly=True)
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, private, max-age=0'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '0'
-    response.headers['Clear-Site-Data'] = '"cookies", "storage", "cache"'
-    
-    return response
+async def logout_post(request: Request):
+    """Handle POST logout requests."""
+    return await logout_get(request)
 
 
 # --- Main Routes ---
@@ -1032,8 +1034,7 @@ async def index(request: Request, username: Annotated[str, Depends(get_current_u
         "index.html", {
             "request": request, 
             "services": service_data, 
-            "username": username,
-            "user_scopes": user_scopes if user_scopes else None  # Pass scopes to template
+            "username": username
         }
     )
 
