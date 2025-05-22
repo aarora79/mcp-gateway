@@ -49,7 +49,8 @@ RUN . /app/.venv/bin/activate && uv pip install \
     "huggingface-hub[cli]>=0.31.1" \
     "pyjwt[crypto]>=2.8.0" \
     "pycognito>=2024.3.1" \
-    "boto3>=1.28.0"
+    "boto3>=1.28.0" \
+    "requests>=2.32.3"
 
 # Copy the rest of the application
 COPY . /app/

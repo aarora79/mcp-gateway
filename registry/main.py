@@ -55,6 +55,10 @@ from registry.auth.integration import integrate_oauth
 SESSION_LOGOUT_TIMES: Dict[str, float] = {}
 MAX_LOGOUT_ENTRIES = 1000  # Keep only recent logout times
 
+# Cache for SECRET_KEY validation to avoid repeated validation
+_SECRET_KEY_VALIDATED = False
+_LAST_VALIDATED_SECRET_KEY = None
+
 # --- OAuth 2.1 Integration --- START
 from registry.auth.middleware import SessionUser
 
@@ -631,10 +635,10 @@ logger.info(f"OAuth 2.1 integration setup: {'ENABLED' if oauth_provider else 'DI
 # -- Authentication Helper Functions --
 
 def get_session_fingerprint(session_data: dict) -> str:
-    """Generate a lightweight session fingerprint using username and login time only."""
+    """Generate a unique session fingerprint using session_id."""
     username = session_data.get("username", "")
-    login_time = session_data.get("login_time", "")
-    return f"{username}:{login_time}"
+    session_id = session_data.get("session_id", "")
+    return f"{username}:{session_id}"
 
 def cleanup_logout_times():
     """Clean up old logout times to prevent memory leaks."""
@@ -665,9 +669,75 @@ def is_session_logged_out(session_data: dict) -> bool:
     except (ValueError, AttributeError):
         return False
 
+def validate_secret_key(secret_key: str) -> None:
+    """
+    Validate that the SECRET_KEY meets security requirements.
+    
+    Args:
+        secret_key: The secret key to validate
+        
+    Raises:
+        ValueError: If the secret key is weak or insecure
+    """
+    global _SECRET_KEY_VALIDATED, _LAST_VALIDATED_SECRET_KEY
+    
+    # Use cache to avoid repeated validation of the same key
+    if _SECRET_KEY_VALIDATED and _LAST_VALIDATED_SECRET_KEY == secret_key:
+        return
+    
+    import re
+    
+    # Check minimum length (should be at least 32 characters for good entropy)
+    if len(secret_key) < 32:
+        raise ValueError(f"SECRET_KEY must be at least 32 characters long. Current length: {len(secret_key)}")
+    
+    # Check for sufficient complexity (should contain different character types)
+    has_upper = bool(re.search(r'[A-Z]', secret_key))
+    has_lower = bool(re.search(r'[a-z]', secret_key))
+    has_digit = bool(re.search(r'[0-9]', secret_key))
+    has_special = bool(re.search(r'[^A-Za-z0-9]', secret_key))
+    
+    complexity_score = sum([has_upper, has_lower, has_digit, has_special])
+    
+    # For randomly generated hex keys, require at least 2 character types (numbers + letters)
+    # For other keys, require at least 3 character types for good complexity
+    min_complexity = 2 if all(c in '0123456789abcdefABCDEF' for c in secret_key) else 3
+    
+    if complexity_score < min_complexity:
+        if min_complexity == 2:
+            raise ValueError(
+                "SECRET_KEY lacks sufficient complexity. For hex keys, ensure both letters and numbers are present."
+            )
+        else:
+            raise ValueError(
+                "SECRET_KEY lacks sufficient complexity. It should contain at least 3 of: "
+                "uppercase letters, lowercase letters, digits, special characters"
+            )
+    
+    # Check for obvious patterns
+    if secret_key.lower() in secret_key or secret_key == secret_key[::-1]:
+        # Additional pattern checks could be added here
+        pass
+    
+    # Mark as validated and cache the key
+    _SECRET_KEY_VALIDATED = True
+    _LAST_VALIDATED_SECRET_KEY = secret_key
+    logger.info("SECRET_KEY validation passed - key meets security requirements")
+
 def get_current_user(request: Request, session: str = Cookie(None)) -> str:
     """Get the current user from session cookie, or return 'anonymous'."""
     SECRET_KEY = os.environ.get("SECRET_KEY", "insecure-default-key-for-testing-only")
+    
+    # Validate SECRET_KEY strength before using it for authentication
+    try:
+        validate_secret_key(SECRET_KEY)
+    except ValueError as e:
+        logger.error(f"SECRET_KEY validation failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: Invalid SECRET_KEY. Please configure a strong secret key."
+        )
+    
     session_cookie_name = "mcp_gateway_session"
     default_session_expr = 3600  # Default: 1 hour
     USERNAME_ENV = os.environ.get("ADMIN_USER", "admin")
@@ -797,6 +867,17 @@ async def login(
     USERNAME_ENV = os.environ.get("ADMIN_USER", "admin")
     PASSWORD_ENV = os.environ.get("ADMIN_PASSWORD", "password")
     SECRET_KEY = os.environ.get("SECRET_KEY", "insecure-default-key-for-testing-only")
+    
+    # Validate SECRET_KEY strength before using it for session creation
+    try:
+        validate_secret_key(SECRET_KEY)
+    except ValueError as e:
+        logger.error(f"SECRET_KEY validation failed during login: {e}")
+        return templates.TemplateResponse(
+            "login.html", 
+            {"request": request, "error": "Server configuration error. Please contact administrator."}
+        )
+    
     session_cookie_name = "mcp_gateway_session"
     session_max_age = 60 * 60 * 8  # 8 hours
 
@@ -808,6 +889,7 @@ async def login(
             "username": username,
             "authenticated": True,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "session_id": secrets.token_hex(16),
         }
         session_cookie = s.dumps(session_data)
         

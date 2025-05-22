@@ -228,9 +228,8 @@ for server_dir in /app/servers/*; do
         echo "Processing directory: $server_dir (port: $server_port, server: $server_name)"
         cd "$server_dir"
         
-        # Create virtual environment if needed
-        uv venv .venv
-        source .venv/bin/activate
+        # Use the global virtual environment instead of creating individual ones
+        # The global venv already has all necessary dependencies installed
         
         if [ -f "pyproject.toml" ]; then
             # Check for README.md file that might be referenced in pyproject.toml
@@ -239,10 +238,12 @@ for server_dir in /app/servers/*; do
                 echo "# $server_name MCP Server" > README.md
             fi
             
-            # Install the server package
-            echo "Installing server package for $server_name"
-            uv pip install -e . || {
-                echo "WARNING: Failed to install $server_name with uv. Falling back to direct module execution."
+            # Install the server package dependencies into the global venv
+            echo "Installing dependencies for $server_name in global venv"
+            uv pip install -e . 2>&1 || {
+                echo "WARNING: Failed to install $server_name as editable package."
+                echo "This may cause import issues for the server."
+                # Continue anyway since dependencies might already be installed globally
             }
         fi
         

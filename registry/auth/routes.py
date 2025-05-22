@@ -352,6 +352,7 @@ async def oauth_callback(request: Request, code: str = None, state: str = None):
                 "email": user_info.get('email', ''),
                 "provider_type": _settings.idp_settings.provider_type,  # Store the provider type for logout
                 "login_time": datetime.now().isoformat(),  # Add timestamp for debugging
+                "session_id": secrets.token_hex(16),  # Unique session identifier
                 "auth_method": "oauth"  # Add redundant auth method indicator for safety
             }
             

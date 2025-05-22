@@ -174,15 +174,6 @@
         .search-bar button:hover {
             background-color: var(--card-border); /* Darken slightly on hover */
         }
-        
-        /* User scopes display */
-        .user-scopes {
-            font-size: 0.8em;
-            color: var(--text-color);
-            opacity: 0.7;
-            margin-left: 8px;
-            font-style: italic;
-        }
         .search-bar input[type="search"] {
             background-color: var(--input-bg);
             color: var(--input-text);
@@ -2176,15 +2167,6 @@
             <button id="theme-toggle" class="theme-toggle-button" title="Toggle Theme">🌙</button>
             <span class="user-display">
                 Logged in as <strong>{{ username }}</strong>
-                {% if user_scopes %}
-                <span class="user-scopes" data-scopes="{{ ','.join(user_scopes) }}">
-                    [{{ ', '.join(user_scopes) }}]
-                </span>
-                {% elif request.state.user and request.state.user.scopes %}
-                <span class="user-scopes" data-scopes="{{ ','.join(request.state.user.scopes) }}">
-                    [{{ ', '.join(request.state.user.scopes) }}]
-                </span>
-                {% endif %}
             </span>
             <form action="/logout" method="post" style="display: inline;">
                 <button type="submit" class="logout-button">Logout</button>

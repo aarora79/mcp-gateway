@@ -583,67 +583,135 @@ class ConfigurableIdPAdapter(OAuthAuthorizationServerProvider[MCP_AuthCode, Refr
             logger.warning(f"JWT validation failed: {e}")
             return None
     
+    async def _get_jwks(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch JWKS (JSON Web Key Set) from the identity provider.
+        
+        Returns:
+            The JWKS data or None if retrieval fails
+        """
+        if not self.idp_settings.jwks_url:
+            logger.warning("No JWKS URL configured for JWT validation")
+            return None
+            
+        try:
+            # Use a reasonably short timeout to prevent delays
+            timeout_seconds = int(os.environ.get("MCP_AUTH_IDP_TIMEOUT", "10"))
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    self.idp_settings.jwks_url,
+                    timeout=timeout_seconds
+                )
+                response.raise_for_status()
+                return response.json()
+                
+        except Exception as e:
+            logger.error(f"Failed to fetch JWKS from {self.idp_settings.jwks_url}: {e}")
+            return None
+
     def _decode_and_validate_jwt(self, token: str) -> Optional[Dict[str, Any]]:
         """
-        Decode and validate a JWT token.
+        Decode and validate a JWT token with proper signature verification.
         
         Subclasses can override this method to implement provider-specific validation.
-        The base implementation does minimal validation without signature verification.
         """
         try:
-            # Simple decode without verification for demonstration
-            # In production, proper signature verification should be implemented
-            decoded = jwt.decode(token, options={"verify_signature": False})
+            # First, decode headers to get key ID
+            unverified_header = jwt.get_unverified_header(token)
+            kid = unverified_header.get("kid")
             
-            # Basic validation
-            current_time = time.time()
+            if not kid:
+                logger.warning("JWT token missing key ID (kid) in header")
+                raise TokenError(
+                    error="invalid_token",
+                    error_description="Token missing key ID"
+                )
             
-            # Check expiration
-            if "exp" in decoded and decoded["exp"] < current_time:
-                logger.warning(f"Token expired at {decoded['exp']}, current time is {current_time}")
+            # Get JWKS to find the public key
+            import asyncio
+            jwks = asyncio.run(self._get_jwks())
+            if not jwks:
+                logger.error("Unable to retrieve JWKS for token verification")
+                raise TokenError(
+                    error="invalid_token", 
+                    error_description="Unable to verify token signature"
+                )
+            
+            # Find the matching key
+            public_key = None
+            for key in jwks.get("keys", []):
+                if key.get("kid") == kid:
+                    # Convert JWK to PEM format for PyJWT
+                    from jwt.algorithms import RSAAlgorithm
+                    public_key = RSAAlgorithm.from_jwk(key)
+                    break
+            
+            if not public_key:
+                logger.warning(f"No matching key found for kid: {kid}")
                 raise TokenError(
                     error="invalid_token",
-                    error_description="Token has expired"
+                    error_description="Unable to verify token signature"
                 )
-                
-            # Check not before
-            if "nbf" in decoded and decoded["nbf"] > current_time:
-                logger.warning(f"Token not valid until {decoded['nbf']}, current time is {current_time}")
-                raise TokenError(
-                    error="invalid_token",
-                    error_description="Token not yet valid"
-                )
-                
-            # Check issuer if configured
-            if self.idp_settings.issuer and decoded.get("iss") != self.idp_settings.issuer:
-                logger.warning(f"Token issuer {decoded.get('iss')} doesn't match configured issuer {self.idp_settings.issuer}")
-                raise TokenError(
-                    error="invalid_token",
-                    error_description="Invalid token issuer"
-                )
-                
-            # Check audience if configured
-            if self.idp_settings.audience:
-                aud = decoded.get("aud", "")
-                if isinstance(aud, list):
-                    if self.idp_settings.audience not in aud:
-                        logger.warning(f"Token audience {aud} doesn't include configured audience {self.idp_settings.audience}")
-                        raise TokenError(
-                            error="invalid_token",
-                            error_description="Invalid token audience"
-                        )
-                elif aud != self.idp_settings.audience:
-                    logger.warning(f"Token audience {aud} doesn't match configured audience {self.idp_settings.audience}")
-                    raise TokenError(
-                        error="invalid_token",
-                        error_description="Invalid token audience"
-                    )
-                    
+            
+            # Decode and verify the token with signature verification enabled
+            decoded = jwt.decode(
+                token,
+                public_key,
+                algorithms=["RS256"],  # Most OAuth providers use RS256
+                audience=self.idp_settings.audience,
+                issuer=self.idp_settings.issuer,
+                options={
+                    "verify_signature": True,
+                    "verify_exp": True,
+                    "verify_nbf": True,
+                    "verify_iat": True,
+                    "verify_aud": True if self.idp_settings.audience else False,
+                    "verify_iss": True if self.idp_settings.issuer else False
+                }
+            )
+            
+            # PyJWT has already validated exp, nbf, iat, aud, and iss claims
+            # Return the validated claims
+            logger.info("JWT token validated successfully with signature verification")
             return decoded
             
+        except jwt.ExpiredSignatureError:
+            logger.warning("JWT token has expired")
+            raise TokenError(
+                error="invalid_token",
+                error_description="Token has expired"
+            )
+        except jwt.InvalidAudienceError:
+            logger.warning("JWT token has invalid audience")
+            raise TokenError(
+                error="invalid_token",
+                error_description="Invalid token audience"
+            )
+        except jwt.InvalidIssuerError:
+            logger.warning("JWT token has invalid issuer")
+            raise TokenError(
+                error="invalid_token",
+                error_description="Invalid token issuer"
+            )
+        except jwt.InvalidSignatureError:
+            logger.warning("JWT token has invalid signature")
+            raise TokenError(
+                error="invalid_token",
+                error_description="Invalid token signature"
+            )
+        except jwt.InvalidTokenError as e:
+            logger.warning(f"JWT token is invalid: {e}")
+            raise TokenError(
+                error="invalid_token",
+                error_description="Invalid token"
+            )
         except Exception as e:
-            logger.warning(f"Error decoding JWT: {e}")
-            return None
+            logger.error(f"Unexpected error during JWT validation: {e}")
+            raise TokenError(
+                error="invalid_token",
+                error_description="Token validation failed"
+            )
             
     def _extract_scopes_from_claims(self, claims: Dict[str, Any]) -> List[str]:
         """
