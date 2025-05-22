@@ -1,5 +1,16 @@
 #!/bin/bash
 
+# MCP Gateway Server Startup Script
+# 
+# Port Configuration Strategy:
+# - currenttime: default 8001 (CURRENT_TIME_PORT env var)
+# - fininfo: default 8002 (FININFO_PORT env var)  
+# - mcpgw: default 8003 (MCPGW_PORT env var)
+# - realserverfaketools: default 8000 (REALSERVER_PORT env var)
+#
+# Ports can be overridden via environment variables or extracted from
+# registry JSON configuration files for Docker/production deployments.
+
 # Get the absolute path of the directory where this script is run from
 SCRIPT_DIR="$(pwd)"
 

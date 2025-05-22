@@ -148,8 +148,8 @@ server {
     server_name localhost;
 
     # SSL Configuration
-    ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
-    ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+    ssl_certificate /etc/ssl/certs/fullchain.pem;
+    ssl_certificate_key /etc/ssl/private/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
 
     # Duplicate the same location blocks for HTTPS access
@@ -189,12 +189,12 @@ if [ "$NGINX_HTTPS_PORT" != "443" ]; then
 fi
 
 # Generate SSL certificate if needed
-if [ ! -f /etc/ssl/certs/nginx-selfsigned.crt ] || [ ! -f /etc/ssl/private/nginx-selfsigned.key ]; then
+if [ ! -f /etc/ssl/certs/fullchain.pem ] || [ ! -f /etc/ssl/private/privkey.pem ]; then
     echo "Generating self-signed SSL certificate..."
     mkdir -p /etc/ssl/certs /etc/ssl/private
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout /etc/ssl/private/nginx-selfsigned.key \
-        -out /etc/ssl/certs/nginx-selfsigned.crt \
+        -keyout /etc/ssl/private/privkey.pem \
+        -out /etc/ssl/certs/fullchain.pem \
         -subj "/C=US/ST=State/L=City/O=Organization/OU=OrgUnit/CN=localhost"
     echo "SSL certificate generated."
 fi
