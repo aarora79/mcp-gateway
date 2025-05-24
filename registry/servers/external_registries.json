@@ -1,0 +1,33 @@
+{
+  "registries": [
+    {
+      "name": "mcp-run-registry",
+      "url": "https://api.mcp.run",
+      "priority": 1,
+      "timeout_seconds": 15,
+      "retry_attempts": 3,
+      "retry_delay_seconds": 5,
+      "health_check_interval_seconds": 60,
+      "enabled": false,
+      "api_key": null,
+      "headers": {
+        "User-Agent": "MCP-Gateway/1.0"
+      }
+    },
+    {
+      "name": "mkinf-registry",
+      "url": "https://api.mkinf.com",
+      "priority": 2,
+      "timeout_seconds": 10,
+      "retry_attempts": 2,
+      "retry_delay_seconds": 3,
+      "health_check_interval_seconds": 120,
+      "enabled": false,
+      "api_key": null,
+      "headers": {
+        "User-Agent": "MCP-Gateway/1.0"
+      }
+    }
+  ],
+  "updated_at": "2024-01-15T10:00:00Z"
+}
