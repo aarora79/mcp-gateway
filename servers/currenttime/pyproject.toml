@@ -8,4 +8,5 @@ dependencies = [
    "mcp>=1.8.0",
    "pydantic>=2.11.3",
    "requests>=2.32.3",
+   "pytz>=2025.2",
 ]

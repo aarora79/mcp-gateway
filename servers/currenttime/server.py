@@ -74,6 +74,28 @@ The user's location is: {location}
     return system_prompt
 
 
+
+from datetime import datetime
+import pytz
+
+def get_current_time_in_timezone(timezone_name):
+    """
+    Retrieves the current time in a specified timezone.
+
+    Args:
+        timezone_name: A string representing the timezone name (e.g., 'America/New_York', 'Europe/London').
+
+    Returns:
+        A datetime object representing the current time in the specified timezone, or None if the timezone is invalid.
+    """
+    try:
+        timezone = pytz.timezone(timezone_name)
+        current_time = datetime.now(timezone)
+        return current_time
+    except pytz.exceptions.UnknownTimeZoneError:
+        return None
+
+
 @mcp.tool()
 def current_time_by_timezone(
     tz_name: Annotated[str, Field(
@@ -88,45 +110,19 @@ def current_time_by_timezone(
         tz_name: Name of the timezone for which to find out the current time (default: America/New_York)
 
     Returns:
-        str: JSON response from the API with current time information
+        str: string representation of the current time in the %Y-%m-%d %H:%M:%S %Z%z format for the specified timezone.
 
     Raises:
-        Exception: If the API request fails after maximum retries
+        Exception: If the API request fails
     """
-    url = "https://timeapi.io/api/time/current/zone"
-    headers = {"accept": "application/json"}
-    params_dict = {"timeZone": tz_name}
 
-    # Retry configuration
-    max_retries = 5
-    base_delay = 1  # seconds
-    max_delay = 30  # seconds
-
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, headers=headers, params=params_dict)
-            response.raise_for_status()  # Raise an exception for 4XX/5XX responses
-
-            # Return the JSON response as a string
-            return response.text
-
-        except requests.exceptions.RequestException as e:
-            # Calculate backoff delay with jitter
-            delay = min(base_delay * (2**attempt) + random.uniform(0, 1), max_delay)
-
-            # If this was our last retry, raise the exception
-            if attempt == max_retries - 1:
-                raise Exception(
-                    f"Failed to get time after {max_retries} attempts: {str(e)}"
-                )
-
-            logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
-            logger.info(f"Retrying in {delay:.2f} seconds...")
-
-            # Wait before retrying
-            time.sleep(delay)
-
-
+    try:
+        timezone = pytz.timezone(tz_name)
+        current_time = datetime.now(timezone)
+        return current_time.strftime('%Y-%m-%d %H:%M:%S %Z%z')
+    except Exception as e:
+        return f"Error: {str(e)}"
+    
 @mcp.resource("config://app")
 def get_config() -> str:
     """Static configuration data"""

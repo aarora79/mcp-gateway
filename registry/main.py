@@ -511,6 +511,18 @@ async def broadcast_health_status():
 
 # --- Setup FastAPI Application ---
 
+# Session management configuration
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    # Generate a secure random key (32 bytes = 256 bits of entropy)
+    SECRET_KEY = secrets.token_hex(32)
+    logger.warning("No SECRET_KEY environment variable found. Using a randomly generated key. "
+                   "While this is more secure than a hardcoded default, it will change on restart. "
+                   "Set a permanent SECRET_KEY environment variable for production.")
+SESSION_COOKIE_NAME = "mcp_gateway_session"
+signer = URLSafeTimedSerializer(SECRET_KEY)
+SESSION_MAX_AGE_SECONDS = 60 * 60 * 8  # 8 hours
+
 # Lifespan handler to initialize and cleanup resources
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1352,7 +1364,7 @@ def regenerate_nginx_config():
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         
-        # Handle content negotiation 
+        # Handle content negotiation
         proxy_set_header Accept "application/json, text/event-stream";
         
         # Pass through authentication headers for service-specific tokens
@@ -1367,6 +1379,21 @@ def regenerate_nginx_config():
         error_page 500 502 503 504 = @error5xx;
     }}"""
         dynamic_locations.append(streamable_location)
+
+COMMENTED_LOCATION_BLOCK_TEMPLATE = """
+#    location {path}/ {{
+#        proxy_pass {proxy_pass_url};
+#        proxy_http_version 1.1;
+#        proxy_set_header Host $host;
+#        proxy_set_header X-Real-IP $remote_addr;
+#        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#        proxy_set_header X-Forwarded-Proto $scheme;
+#    }}
+"""
+
+def regenerate_nginx_config():
+    """Generates the nginx config file based on registered servers and their state."""
+    logger.info(f"Attempting to directly modify Nginx config at {NGINX_CONFIG_PATH}...")
     
     dynamic_locations.append(end_marker)
     
@@ -1381,18 +1408,127 @@ def regenerate_nginx_config():
         
         # Reload Nginx if possible
         try:
-            result = subprocess.run(["nginx", "-s", "reload"], capture_output=True, text=True)
+            logger.info("Attempting to reload Nginx configuration...")
+            result = subprocess.run(['/usr/sbin/nginx', '-s', 'reload'], capture_output=True, text=True)
             if result.returncode == 0:
-                logger.info("Nginx reloaded successfully")
-            else:
-                logger.warning(f"Nginx reload failed: {result.stderr}")
+                logger.info(f"Nginx reload successful. stdout: {result.stdout.strip()}")
+                return True
+        except FileNotFoundError:
+            logger.error("'nginx' command not found. Cannot reload configuration.")
+            return False
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to reload Nginx configuration. Return code: {e.returncode}")
+            logger.error(f"Nginx reload stderr: {e.stderr.strip()}")
+            logger.error(f"Nginx reload stdout: {e.stdout.strip()}")
+            return False
         except Exception as e:
-            logger.warning(f"Failed to reload Nginx: {e}")
-        
-        return True
-    except Exception as e:
-        logger.error(f"Failed to write new Nginx config: {e}")
+            logger.error(f"An unexpected error occurred during Nginx reload: {e}", exc_info=True)
+            return False
+        # --- Reload Nginx --- END
+
+    except FileNotFoundError:
+        logger.error(f"Target Nginx config file not found at {NGINX_CONFIG_PATH}. Cannot regenerate.")
         return False
+    except Exception as e:
+        logger.error(f"Failed to modify Nginx config at {NGINX_CONFIG_PATH}: {e}", exc_info=True)
+        return False
+
+# --- Helper function to normalize a path to a filename ---
+def path_to_filename(path):
+    # Remove leading slash and replace remaining slashes with underscores
+    normalized = path.lstrip("/").replace("/", "_")
+    # Append .json extension if not present
+    if not normalized.endswith(".json"):
+        normalized += ".json"
+    return normalized
+
+
+# --- Data Loading ---
+def load_registered_servers_and_state():
+    global REGISTERED_SERVERS, MOCK_SERVICE_STATE
+    logger.info(f"Loading server definitions from {SERVERS_DIR}...")
+
+    # Create servers directory if it doesn't exist
+    SERVERS_DIR.mkdir(parents=True, exist_ok=True) # Added parents=True
+
+    temp_servers = {}
+    server_files = list(SERVERS_DIR.glob("**/*.json"))
+    logger.info(f"Found {len(server_files)} JSON files in {SERVERS_DIR} and its subdirectories")
+    for file in server_files:
+        logger.info(f"[DEBUG] - {file.relative_to(SERVERS_DIR)}")
+
+    if not server_files:
+        logger.warning(f"No server definition files found in {SERVERS_DIR}. Initializing empty registry.")
+        REGISTERED_SERVERS = {}
+        # Don't return yet, need to load state file
+        # return
+
+    for server_file in server_files:
+        if server_file.name == STATE_FILE_PATH.name: # Skip the state file itself
+            continue
+        try:
+            with open(server_file, "r") as f:
+                server_info = json.load(f)
+
+                if (
+                    isinstance(server_info, dict)
+                    and "path" in server_info
+                    and "server_name" in server_info
+                ):
+                    server_path = server_info["path"]
+                    if server_path in temp_servers:
+                        logger.warning(f"Duplicate server path found in {server_file}: {server_path}. Overwriting previous definition.")
+
+                    # Add new fields with defaults
+                    server_info["description"] = server_info.get("description", "")
+                    server_info["tags"] = server_info.get("tags", [])
+                    server_info["num_tools"] = server_info.get("num_tools", 0)
+                    server_info["num_stars"] = server_info.get("num_stars", 0)
+                    server_info["is_python"] = server_info.get("is_python", False)
+                    server_info["license"] = server_info.get("license", "N/A")
+                    server_info["proxy_pass_url"] = server_info.get("proxy_pass_url", None)
+                    server_info["tool_list"] = server_info.get("tool_list", []) # Initialize tool_list if missing
+
+                    temp_servers[server_path] = server_info
+                else:
+                    logger.warning(f"Invalid server entry format found in {server_file}. Skipping.")
+        except FileNotFoundError:
+            logger.error(f"Server definition file {server_file} reported by glob not found.")
+        except json.JSONDecodeError as e:
+            logger.error(f"Could not parse JSON from {server_file}: {e}.")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred loading {server_file}: {e}", exc_info=True)
+
+    REGISTERED_SERVERS = temp_servers
+    logger.info(f"Successfully loaded {len(REGISTERED_SERVERS)} server definitions.")
+
+    # --- Load persisted mock service state --- START
+    logger.info(f"Attempting to load persisted state from {STATE_FILE_PATH}...")
+    loaded_state = {}
+    try:
+        if STATE_FILE_PATH.exists():
+            with open(STATE_FILE_PATH, "r") as f:
+                loaded_state = json.load(f)
+            if not isinstance(loaded_state, dict):
+                logger.warning(f"Invalid state format in {STATE_FILE_PATH}. Expected a dictionary. Resetting state.")
+                loaded_state = {} # Reset if format is wrong
+            else:
+                logger.info(f"Loaded state for {len(loaded_state)} services.")
+        else:
+            logger.info(f"No state file found at {STATE_FILE_PATH}. Starting with empty state.")
+    except json.JSONDecodeError:
+        logger.warning(f"Could not parse JSON from {STATE_FILE_PATH}. Resetting state.")
+    except Exception as e:
+        logger.error(f"Error loading state file: {e}", exc_info=True)
+    
+    # Initialize state for all registered servers
+    for path in REGISTERED_SERVERS:
+        if path not in MOCK_SERVICE_STATE:
+            # Default to enabled for new services
+            MOCK_SERVICE_STATE[path] = loaded_state.get(path, True)
+    
+    logger.info(f"Service state initialized with {len(MOCK_SERVICE_STATE)} entries.")
+    # --- Load persisted mock service state --- END
 
 # --- Check function to test if a service is healthy ---
 async def perform_single_health_check(path: str):

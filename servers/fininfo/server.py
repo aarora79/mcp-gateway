@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s.%(msecs)03d - PID:%(process)d - %(filename)s:%(lineno)d - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -69,49 +69,6 @@ args = parse_arguments()
 
 # Initialize FastMCP server using parsed arguments
 mcp = FastMCP("fininfo", port=args.port)
-
-
-class StockAggregateParams(BaseModel):
-    """Parameters for retrieving stock aggregate data from Polygon.io API"""
-
-    stock_ticker: str = Field(
-        ..., description="Case-sensitive ticker symbol (e.g., 'AAPL')"
-    )
-    multiplier: int = Field(..., description="Size of the timespan multiplier")
-    timespan: str = Field(..., description="Size of the time window")
-    from_date: str = Field(
-        ..., description="Start date in YYYY-MM-DD format or millisecond timestamp"
-    )
-    to_date: str = Field(
-        ..., description="End date in YYYY-MM-DD format or millisecond timestamp"
-    )
-    adjusted: bool = Field(True, description="Whether results are adjusted for splits")
-    sort: Optional[str] = Field(
-        None, description="Sort results by timestamp ('asc' or 'desc')"
-    )
-    limit: int = Field(
-        5000, description="Maximum number of base aggregates (max 50000)"
-    )
-
-    @validator("timespan")
-    def validate_timespan(cls, v):
-        valid_timespans = ["minute", "hour", "day", "week", "month", "quarter", "year"]
-        if v not in valid_timespans:
-            raise ValueError(f"Invalid timespan. Must be one of {valid_timespans}")
-        return v
-
-    @validator("sort")
-    def validate_sort(cls, v):
-        if v is not None and v not in ["asc", "desc"]:
-            raise ValueError("Sort must be either 'asc', 'desc', or None")
-        return v
-
-    @validator("limit")
-    def validate_limit(cls, v):
-        if v > 50000:
-            raise ValueError("Limit cannot exceed 50000")
-        return v
-
 
 @mcp.tool()
 def get_stock_aggregates(
@@ -175,7 +132,7 @@ def get_stock_aggregates(
     retry_count = 0
     while retry_count < Constants.MAX_RETRIES:
         try:
-            response = requests.get(url, params=query_params)
+            response = requests.get(url, params=query_params, timeout=10)
             response.raise_for_status()  # Raise exception for 4XX/5XX responses
 
             # Return the JSON response

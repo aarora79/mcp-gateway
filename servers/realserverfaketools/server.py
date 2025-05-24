@@ -5,7 +5,7 @@ These tools are stubbed out and return mock responses for demonstration purposes
 
 import os
 import time
-import random
+import secrets  # Replaced random with secrets
 import argparse
 import logging
 import json
@@ -21,6 +21,29 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Helper functions for replacing random functions with secrets equivalents
+def secure_uniform(min_val, max_val, precision=2):
+    """Generate a secure random float between min_val and max_val with specified precision"""
+    range_val = int((max_val - min_val) * (10 ** precision))
+    return min_val + (secrets.randbelow(range_val + 1) / (10 ** precision))
+
+def secure_random():
+    """Generate a secure random float between 0 and 1"""
+    return secrets.randbelow(10000) / 10000
+
+def secure_choice(sequence):
+    """Select a random element from a sequence using cryptographically secure randomness"""
+    return sequence[secrets.randbelow(len(sequence))]
+
+def secure_sample(population, k):
+    """Select k unique elements from a population using cryptographically secure randomness"""
+    result = []
+    population_copy = list(population)
+    for i in range(min(k, len(population_copy))):
+        idx = secrets.randbelow(len(population_copy))
+        result.append(population_copy.pop(idx))
+    return result
 
 def parse_arguments():
     """Parse command line arguments with defaults matching environment variables."""
@@ -118,21 +141,21 @@ def quantum_flux_analyzer(
         str: JSON response with mock quantum flux analysis results
     """
     # Simulate processing time
-    time.sleep(random.uniform(0.5, 1.5))
+    time.sleep(secure_uniform(0.5, 1.5))
     
     # Generate mock response
     result = {
-        "analysis_id": f"QFA-{random.randint(10000, 99999)}",
+        "analysis_id": f"QFA-{10000 + secrets.randbelow(90000)}",
         "timestamp": datetime.now().isoformat(),
         "energy_level": energy_level,
         "stabilization_factor": stabilization_factor,
         "temporal_shift_enabled": enable_temporal_shift,
         "flux_patterns": [
-            {"pattern_id": f"P{i}", "intensity": random.uniform(0.1, 0.9), "stability": random.uniform(0.2, 1.0)}
+            {"pattern_id": f"P{i}", "intensity": secure_uniform(0.1, 0.9), "stability": secure_uniform(0.2, 1.0)}
             for i in range(1, energy_level + 3)
         ],
         "analysis_summary": "Quantum flux patterns analyzed successfully with simulated data.",
-        "confidence_score": random.uniform(0.65, 0.98)
+        "confidence_score": secure_uniform(0.65, 0.98)
     }
     
     return json.dumps(result, indent=2)
@@ -164,13 +187,13 @@ def neural_pattern_synthesizer(
         Dict[str, Any]: Dictionary with mock neural pattern synthesis results
     """
     # Simulate processing time
-    time.sleep(random.uniform(0.8, 2.0))
+    time.sleep(secure_uniform(0.8, 2.0))
     
     # Generate mock response
     pattern_count = len(input_patterns)
     
     result = {
-        "synthesis_id": f"NPS-{random.randint(10000, 99999)}",
+        "synthesis_id": f"NPS-{10000 + secrets.randbelow(90000)}",
         "timestamp": datetime.now().isoformat(),
         "input_pattern_count": pattern_count,
         "coherence_threshold": coherence_threshold,
@@ -178,18 +201,18 @@ def neural_pattern_synthesizer(
         "synthesized_patterns": [
             {
                 "original": pattern,
-                "synthesized": f"syn_{pattern}_{random.randint(100, 999)}",
-                "coherence_score": random.uniform(coherence_threshold - 0.2, coherence_threshold + 0.2),
-                "dimensional_stability": [random.uniform(0.5, 0.95) for _ in range(dimensions)]
+                "synthesized": f"syn_{pattern}_{100 + secrets.randbelow(900)}",
+                "coherence_score": secure_uniform(coherence_threshold - 0.2, coherence_threshold + 0.2),
+                "dimensional_stability": [secure_uniform(0.5, 0.95) for _ in range(dimensions)]
             }
             for pattern in input_patterns
         ],
-        "overall_synthesis_quality": random.uniform(0.6, 0.95),
+        "overall_synthesis_quality": secure_uniform(0.6, 0.95),
         "recommended_adjustments": [
             "Increase pattern diversity",
             "Adjust coherence threshold",
             "Consider higher dimensional analysis"
-        ] if random.random() > 0.5 else []
+        ] if secure_random() > 0.5 else []
     }
     
     return result
@@ -221,13 +244,13 @@ def hyper_dimensional_mapper(
         str: JSON response with mock hyper-dimensional mapping results
     """
     # Simulate processing time
-    time.sleep(random.uniform(1.0, 2.5))
+    time.sleep(secure_uniform(1.0, 2.5))
     
     # Generate mock response
-    hyper_coords = [random.uniform(-100, 100) for _ in range(dimension_count)]
+    hyper_coords = [secure_uniform(-100, 100) for _ in range(dimension_count)]
     
     result = {
-        "mapping_id": f"HDM-{random.randint(10000, 99999)}",
+        "mapping_id": f"HDM-{10000 + secrets.randbelow(90000)}",
         "timestamp": datetime.now().isoformat(),
         "source_coordinates": {
             "latitude": coordinates.latitude,
@@ -239,12 +262,12 @@ def hyper_dimensional_mapper(
         },
         "reality_anchoring_factor": reality_anchoring,
         "stability_assessment": {
-            "temporal_stability": random.uniform(0.5, 0.9),
-            "spatial_coherence": random.uniform(0.6, 0.95),
-            "dimensional_bleed": random.uniform(0.05, 0.3)
+            "temporal_stability": secure_uniform(0.5, 0.9),
+            "spatial_coherence": secure_uniform(0.6, 0.95),
+            "dimensional_bleed": secure_uniform(0.05, 0.3)
         },
-        "navigation_safety": "GREEN" if random.random() > 0.7 else "YELLOW",
-        "estimated_mapping_accuracy": f"{random.uniform(85, 99):.2f}%"
+        "navigation_safety": "GREEN" if secure_random() > 0.7 else "YELLOW",
+        "estimated_mapping_accuracy": f"{secure_uniform(85, 99):.2f}%"
     }
     
     return json.dumps(result, indent=2)
@@ -275,13 +298,13 @@ def temporal_anomaly_detector(
         Dict[str, Any]: Dictionary with mock temporal anomaly detection results
     """
     # Simulate processing time
-    time.sleep(random.uniform(1.2, 3.0))
+    time.sleep(secure_uniform(1.2, 3.0))
     
     # Generate mock response
-    anomaly_count = random.randint(0, sensitivity)
+    anomaly_count = secrets.randbelow(sensitivity + 1)
     
     result = {
-        "detection_id": f"TAD-{random.randint(10000, 99999)}",
+        "detection_id": f"TAD-{10000 + secrets.randbelow(90000)}",
         "timestamp": datetime.now().isoformat(),
         "timeframe": timeframe,
         "sensitivity_level": sensitivity,
@@ -289,24 +312,24 @@ def temporal_anomaly_detector(
         "anomalies_detected": anomaly_count,
         "anomaly_details": [
             {
-                "anomaly_id": f"A{random.randint(1000, 9999)}",
-                "type": random.choice(anomaly_types),
-                "severity": random.uniform(0.1, 1.0),
+                "anomaly_id": f"A{1000 + secrets.randbelow(9000)}",
+                "type": secure_choice(anomaly_types),
+                "severity": secure_uniform(0.1, 1.0),
                 "temporal_coordinates": {
-                    "t": random.uniform(-10, 10),
-                    "x": random.uniform(-5, 5),
-                    "y": random.uniform(-5, 5),
-                    "z": random.uniform(-5, 5)
+                    "t": secure_uniform(-10, 10),
+                    "x": secure_uniform(-5, 5),
+                    "y": secure_uniform(-5, 5),
+                    "z": secure_uniform(-5, 5)
                 },
-                "causality_impact": random.choice(["LOW", "MEDIUM", "HIGH", "CRITICAL"]),
-                "recommended_action": random.choice([
+                "causality_impact": secure_choice(["LOW", "MEDIUM", "HIGH", "CRITICAL"]),
+                "recommended_action": secure_choice([
                     "Monitor", "Investigate", "Contain", "Neutralize", "Temporal reset required"
                 ])
             }
             for _ in range(anomaly_count)
         ],
-        "background_temporal_stability": f"{random.uniform(85, 99.9):.2f}%",
-        "detection_confidence": random.uniform(0.7, 0.98)
+        "background_temporal_stability": f"{secure_uniform(85, 99.9):.2f}%",
+        "detection_confidence": secure_uniform(0.7, 0.98)
     }
     
     return result
@@ -332,11 +355,11 @@ def user_profile_analyzer(
         str: JSON response with mock user profile analysis results
     """
     # Simulate processing time
-    time.sleep(random.uniform(0.7, 1.8))
+    time.sleep(secure_uniform(0.7, 1.8))
     
     # Generate mock response
     result = {
-        "analysis_id": f"UPA-{random.randint(10000, 99999)}",
+        "analysis_id": f"UPA-{10000 + secrets.randbelow(90000)}",
         "timestamp": datetime.now().isoformat(),
         "user": {
             "username": profile.username,
@@ -348,13 +371,13 @@ def user_profile_analyzer(
         "metadata_included": analysis_options.include_metadata,
         "applied_filters": analysis_options.filters if analysis_options.filters else "none",
         "analysis_results": {
-            "engagement_score": random.uniform(0, 100),
-            "activity_pattern": random.choice(["Regular", "Sporadic", "Intensive", "Declining"]),
+            "engagement_score": secure_uniform(0, 100),
+            "activity_pattern": secure_choice(["Regular", "Sporadic", "Intensive", "Declining"]),
             "interest_clusters": [
                 {
                     "cluster_name": f"Cluster {i+1}",
-                    "interests": random.sample(profile.interests, min(len(profile.interests), random.randint(1, 3))),
-                    "relevance_score": random.uniform(0.5, 0.95)
+                    "interests": secure_sample(profile.interests, min(len(profile.interests), 1 + secrets.randbelow(3))),
+                    "relevance_score": secure_uniform(0.5, 0.95)
                 }
                 for i in range(min(3, len(profile.interests)))
             ] if profile.interests else [],
@@ -369,7 +392,7 @@ def user_profile_analyzer(
                 "Community discussions"
             ]
         },
-        "analysis_quality": f"{random.uniform(85, 98):.1f}%"
+        "analysis_quality": f"{secure_uniform(85, 98):.1f}%"
     }
     
     return json.dumps(result, indent=2)
@@ -399,38 +422,33 @@ def synthetic_data_generator(
     Returns:
         Dict[str, Any]: Dictionary with mock synthetic data generation results
     """
-    # Set seed if provided
-    if seed is not None:
-        random.seed(seed)
+    # Note: Using seed with secrets is not appropriate as it's designed for cryptographic randomness
+    # For this demo, we'll acknowledge the seed parameter but not use it, as secrets doesn't support seeding
     
     # Simulate processing time
-    time.sleep(random.uniform(0.5, 2.0))
+    time.sleep(secure_uniform(0.5, 2.0))
     
     # Generate mock response
     result = {
-        "generation_id": f"SDG-{random.randint(10000, 99999)}",
+        "generation_id": f"SDG-{10000 + secrets.randbelow(90000)}",
         "timestamp": datetime.now().isoformat(),
         "schema_fields": list(schema.keys()),
         "record_count": record_count,
         "seed_used": seed if seed is not None else "not provided",
         "generated_data": [
             {
-                field: f"synthetic_{field}_{i}_{random.randint(1000, 9999)}"
+                field: f"synthetic_{field}_{i}_{1000 + secrets.randbelow(9000)}"
                 for field in schema.keys()
             }
             for i in range(record_count)
         ],
         "data_quality_metrics": {
-            "completeness": random.uniform(0.95, 1.0),
-            "uniqueness": random.uniform(0.9, 1.0),
-            "consistency": random.uniform(0.92, 0.99)
+            "completeness": secure_uniform(0.95, 1.0),
+            "uniqueness": secure_uniform(0.9, 1.0),
+            "consistency": secure_uniform(0.92, 0.99)
         },
-        "generation_time_ms": random.randint(50, 500)
+        "generation_time_ms": 50 + secrets.randbelow(451)
     }
-    
-    # Reset seed if it was set
-    if seed is not None:
-        random.seed()
     
     return result
 

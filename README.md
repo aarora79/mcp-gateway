@@ -9,15 +9,22 @@
 
 # MCP Gateway & Registry
 
-[Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) is an open standard protocol that allows AI Models to connect with external systems, tools, and data sources. A common problem that enterprises face while using MCP servers is that there is a need for a central point of access to a curated list of MCP servers and a catalog of such servers. This is the precise problem that this application provides a solution for by implementing an **MCP Gateway & Registry**. 
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) is an open standard protocol that allows AI Models to connect with external systems, tools, and data sources. While MCP simplifies tool access for Agents and solves data access and internal/external API connectivity challenges, several critical obstacles remain before enterprises can fully realize MCP's promise.
+
+**Discovery & Access Challenges:**
+- **Service Discovery**: How do developers find and access approved MCP servers?
+- **Governed Access**: How do enterprises provide secure, centralized access to curated MCP servers?
+- **Tool Selection**: With hundreds of enterprise MCP servers, how do developers identify the right tools for their specific agents?
+- **Dynamic Discovery**: How can agents dynamically find and use new tools for tasks they weren't originally designed for?
+
+The MCP Gateway & Registry solves these challenges by providing a unified platform that combines centralized access control with intelligent tool discovery. The Registry offers both visual and programmatic interfaces for exploring available MCP servers and tools, while the Gateway ensures secure, governed access to all services. This enables developers to programmatically build smarter agents and allows agents to autonomously discover and execute tools beyond their initial capabilities.
 
 | Resource | Link |
 |----------|------|
-| **Demo Video** | [An open-source MCP Gateway and Registry](https://www.youtube.com/watch?v=o_Wich7AChk) |
+| **Demo Video** | [An open-source MCP Gateway and Registry](https://www.youtube.com/watch?v=o_Wich7AChk), [Dynamic tool discovery & invocation](https://www.youtube.com/watch?v=ZXU8f6NwgE4) |
 | **Medium Post** | [Taming the Chaos: How the MCP Gateway Centralizes Your AI Model's Tools](https://medium.com/@amiarora/taming-the-chaos-how-the-mcp-gateway-centralizes-your-ai-models-tools-3dde64fc9a59) |
 
- 
-
+You can deploy the gateway and registry on Amazon EC2 or Amazon EKS for production environments. Jump to [installation on EC2](#installation-on-ec2) or [installation on EKS](#installation-on-eks) for deployment instructions.
 ## Architecture
 
 The Gateway works by using an [Nginx server](https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/) as a reverse proxy, where each MCP server is handled as a different _path_ and the Nginx reverse proxy sitting between the MCP clients (contained in AI Agents for example) and backend server forwards client requests to appropriate backend servers and returns the responses back to clients. The requested resources are then returned to the client.
@@ -110,6 +117,8 @@ flowchart TB
 
 ## Features
 
+*   **MCP Tool Discovery:** Enables automatic tool discovery by AI Agents and Agent developers. Fetches and displays the list of tools (name, description, schema) based on natural language queries (e.g. _do I have tools to get stock information?_).
+*   **Unified access to a governed list of MCP servers:** Access multiple MCP servers through a common MCP gateway, enabling AI Agents to dynamically discover and execute MCP tools.
 *   **Service Registration:** Register MCP services via JSON files or the web UI/API.
 *   **Web UI:** Manage services, view status, and monitor health through a web interface.
 *   **OAuth 2.1 Authentication:**
@@ -125,7 +134,6 @@ flowchart TB
     *   Manual refresh trigger via UI button or API endpoint.
 *   **Real-time UI Updates:** Uses WebSockets to push health status, tool counts, and last-checked times to all connected clients.
 *   **Dynamic Nginx Configuration:** Generates an Nginx reverse proxy configuration file (`registry/nginx_mcp_revproxy.conf`) based on registered services and their enabled/disabled state.
-*   **MCP Tool Discovery:** Automatically fetches and displays the list of tools (name, description, schema) for healthy services using the MCP client library.
 *   **Service Management:**
     *   Enable/Disable services directly from the UI.
     *   Edit service details (name, description, URL, tags, etc.).
@@ -137,11 +145,13 @@ flowchart TB
 
 ## Prerequisites
 
-*   An Amazon EC2 machine with a standard Ubuntu AMI for running this solution.
+*   An Amazon EC2 machine (`ml.t3.2xlarge`) with a standard Ubuntu AMI for running this solution.
 *   An SSL cert for securing the communication to the Gateway. _This Gateway uses a self-signed cert by default and is also available over HTTP_. 
 *   One of the example MCP servers packaged in this repo uses the [`Polygon`](https://polygon.io/stocks) API for stock ticker data. Get an API key from [here](https://polygon.io/dashboard/signup?redirect=%2Fdashboard%2Fkeys). The server will still start without the API key but you will get a 401 Unauthorized error when using the tools provided by this server.
 
 ## Installation
+
+### Installation on EC2
 
 The Gateway and the Registry are available as a Docker container. The package includes a couple of test MCP servers as well.
 
@@ -221,7 +231,7 @@ The Gateway and the Registry are available as a Docker container. The package in
 1. **View MCP server metadata:**
    Metadata about all MCP servers connected to the Registry is available in `/opt/mcp-gateway/servers` directory. The metadata includes information gathered from `ListTools` as well as information provided while registering the server.
 
-### Running the Gateway over HTTPS
+#### Running the Gateway over HTTPS
 
 1. Enable access to TCP port 443 from the IP address of your MCP client (your laptop, or anywhere) in the inbound rules in the security group associated with your EC2 instance.
 
@@ -243,6 +253,10 @@ The Gateway and the Registry are available as a Docker container. The package in
       -v /opt/mcp-gateway/servers:/app/registry/servers \
       --name mcp-gateway-container   mcp-gateway
     ```
+
+### Installation on EKS
+
+For production deployments you might want to run this solution on EKS, the [Distributed Training and Inference on EKS](https://github.com/aws-samples/amazon-eks-machine-learning-with-terraform-and-kubeflow) repo contains the helm chart for running the gateway and registry on an EKS cluster. Refer to [Serve MCP Gateway Registry](https://github.com/aws-samples/amazon-eks-machine-learning-with-terraform-and-kubeflow/tree/master/examples/agentic/mcp-gateway-registry) README for step  by step instructions.
 
 ## Usage
 

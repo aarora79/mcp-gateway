@@ -21,6 +21,11 @@ dependencies = [
     "torch>=1.6.0",
     "huggingface-hub[cli]>=0.31.1",
     "pyjwt[crypto]>=2.8.0",
+    "bandit>=1.8.3",
+    "langchain-mcp-adapters>=0.0.11",
+    "langgraph>=0.4.3",
+    "langchain-aws>=0.2.23",
+    "pytz>=2025.2",
 ]
 
 [tool.setuptools]

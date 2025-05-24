@@ -5,7 +5,8 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies: nginx, curl (for health checks in registry), procps (for ps command used in stop script), openssl (for cert generation), git (needed by uv sometimes), build-essential (for potential C extensions), sudo (for sudo command)
+# Install minimal system dependencies needed for the container to function
+# All Python-related setup moved to entrypoint.sh for a more lightweight image
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     curl \
@@ -16,9 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-
-# Install uv globally using pip
-RUN pip install uv
 
 # Set the working directory in the container
 WORKDIR /app
@@ -55,27 +53,6 @@ RUN . /app/.venv/bin/activate && uv pip install \
 # Copy the rest of the application
 COPY . /app/
 
-# Now install the package itself (which is quick since dependencies are already installed)
-RUN . /app/.venv/bin/activate && uv pip install -e /app
-
-# Download the sentence-transformers model
-# Create a separate layer for the model directory to improve caching
-RUN mkdir -p /app/registry/models/all-MiniLM-L6-v2
-
-# Use a separate layer for model download with a unique first line comment
-# This ensures Docker can cache the downloaded model
-# The model is large and doesn't change frequently, so caching is important
-RUN . /app/.venv/bin/activate && huggingface-cli download sentence-transformers/all-MiniLM-L6-v2 --local-dir /app/registry/models/all-MiniLM-L6-v2
-
-# Generate self-signed SSL certificate for Nginx
-# Create directories for SSL certs
-RUN mkdir -p /etc/ssl/certs /etc/ssl/private
-# Generate the certificate and key
-RUN openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-    -keyout /etc/ssl/private/privkey.pem \
-    -out /etc/ssl/certs/fullchain.pem \
-    -subj "/C=US/ST=State/L=City/O=Organization/OU=OrgUnit/CN=localhost"
-
 # Copy the custom Nginx configuration (will be moved by entrypoint)
 # Note: We copy it here so it's part of the image layer
 COPY docker/nginx_rev_proxy.conf /app/docker/nginx_rev_proxy.conf
@@ -91,7 +68,7 @@ EXPOSE 80 443 7860
 # Provide sensible defaults or leave empty if they should be explicitly set
 ARG SECRET_KEY=""
 ARG ADMIN_USER="admin"
-ARG ADMIN_PASSWORD="password"
+ARG ADMIN_PASSWORD=""
 ARG POLYGON_API_KEY=""
 ARG MCP_AUTH_ENABLED="false"
 ARG MCP_GATEWAY_DEV_MODE="true"
