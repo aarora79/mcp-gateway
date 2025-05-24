@@ -3,14 +3,332 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Enhanced cache prevention headers -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate, private">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <!-- Prevent storing browsing history -->
+    <meta http-equiv="Clear-Site-Data" content="'cookies', 'storage'">
     <title>Login - MCP Gateway</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}">
+    <!-- Add timestamp to CSS URL to ensure fresh loading -->
+    <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}?v={{ timestamp|default('1') }}">
+    <!-- Add a script to clear any stored OAuth tokens -->
+    <script type="text/javascript">
+        // Function to clear ALL browser storage
+        function clearAllStorage() {
+            console.log("Performing complete browser storage cleanup");
+            
+            try {
+                // Log all existing storage before clearing
+                console.log("localStorage items before clearing:", Object.keys(localStorage));
+                console.log("sessionStorage items before clearing:", Object.keys(sessionStorage));
+                console.log("Cookies before clearing:", document.cookie);
+                
+                // Clear localStorage and sessionStorage completely
+                localStorage.clear();
+                sessionStorage.clear();
+                console.log("Browser storage cleared");
+                
+                // Clear any AWS Cognito/Amplify tokens if they exist
+                if (window.AWS && window.AWS.config && window.AWS.config.credentials) {
+                    window.AWS.config.credentials.clearCachedId();
+                    console.log("AWS credentials cleared");
+                }
+                
+                // Clear all cookies with multiple domain and path combinations to be thorough
+                const domains = [
+                    '', // No domain
+                    window.location.hostname, // Exact hostname
+                    '.' + window.location.hostname, // Subdomain cookies
+                    window.location.hostname.split('.').slice(1).join('.'), // Domain without first part
+                    '.' + window.location.hostname.split('.').slice(1).join('.') // Subdomain with domain without first part
+                ];
+                
+                const paths = ['/', '/oauth', '/api', '/login', '/logout', '/auth', ''];
+                
+                domains.forEach(domain => {
+                    paths.forEach(path => {
+                        document.cookie.split(";").forEach(function(c) {
+                            const cookie = c.trim();
+                            const eqPos = cookie.indexOf("=");
+                            const name = eqPos > -1 ? cookie.substring(0, eqPos) : cookie;
+                            if (name) {
+                                // Set expiration in the past with various domain/path combinations
+                                document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=${path}${domain ? `;domain=${domain}` : ''}`;
+                                // Also try with secure flag
+                                document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=${path}${domain ? `;domain=${domain}` : ''};secure`;
+                                // And with SameSite values
+                                ['None', 'Lax', 'Strict'].forEach(sameSite => {
+                                    document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=${path}${domain ? `;domain=${domain}` : ''};SameSite=${sameSite}`;
+                                });
+                            }
+                        });
+                    });
+                });
+                console.log("Cookies cleared with multiple domain/path combinations");
+                
+                // After clearing, log remaining items for debugging
+                console.log("localStorage items after clearing:", Object.keys(localStorage));
+                console.log("sessionStorage items after clearing:", Object.keys(sessionStorage));
+                console.log("Cookies after clearing:", document.cookie);
+                
+                // Attempt to clear specific authentication tokens by name
+                const storageItems = [
+                    // Common OAuth 2.0 token names
+                    'id_token', 'access_token', 'refresh_token', 'token_type', 'expires_in', 'expires_at',
+                    // OIDC specific
+                    'oidc.user', 'auth.state', 'auth.nonce', 'auth.code_verifier',
+                    // Cognito specific
+                    'CognitoIdentityServiceProvider', 'aws.cognito.identity-id', 'amplify-signin-with-hostedUI',
+                    // Session related
+                    'mcp_gateway_session', 'session', 'user', 'auth'
+                ];
+                
+                storageItems.forEach(item => {
+                    localStorage.removeItem(item);
+                    sessionStorage.removeItem(item);
+                    
+                    // Try to clear cognito specific items with wildcards
+                    if (item === 'CognitoIdentityServiceProvider') {
+                        // Find and clear all cognito related items
+                        Object.keys(localStorage).forEach(key => {
+                            if (key.includes('CognitoIdentityServiceProvider')) {
+                                localStorage.removeItem(key);
+                            }
+                        });
+                        Object.keys(sessionStorage).forEach(key => {
+                            if (key.includes('CognitoIdentityServiceProvider')) {
+                                sessionStorage.removeItem(key);
+                            }
+                        });
+                    }
+                });
+                console.log("Authentication tokens cleared");
+                
+                // Try to clear cache if browser supports it
+                if (window.caches && window.caches.keys) {
+                    window.caches.keys().then(cacheNames => {
+                        cacheNames.forEach(cacheName => {
+                            window.caches.delete(cacheName);
+                        });
+                    });
+                    console.log("Browser cache API cleared");
+                }
+                
+            } catch (e) {
+                console.error("Error during storage clearing:", e);
+            }
+        }
+
+        // Run on page load
+        window.onload = function() {
+            // Check URL parameters
+            const urlParams = new URLSearchParams(window.location.search);
+            const isSignedOut = urlParams.get('signed_out');
+            const isComplete = urlParams.get('complete');
+            const hasError = urlParams.get('error');
+            const nonce = urlParams.get('nonce');  // Unique value to prevent caching
+            
+            console.log(`Login page loaded with params: signed_out=${isSignedOut}, complete=${isComplete}, nonce=${nonce}`);
+            
+            // If signed_out=true, do a complete cleanup
+            if (isSignedOut === 'true') {
+                console.log("User signed out, performing complete cleanup");
+                
+                // Check if we have an IdP logout URL to redirect to
+                const idpLogout = urlParams.get('idp_logout');
+                const providerType = urlParams.get('provider_type');
+                if (idpLogout && !isComplete) {
+                    console.log(`Redirecting to ${providerType} IdP logout:`, idpLogout);
+                    // Clear local storage first, then redirect
+                    clearAllStorage();
+                    setTimeout(() => {
+                        window.location.href = decodeURIComponent(idpLogout);
+                    }, 100); // Small delay to ensure cleanup completes
+                    return;
+                }
+                
+                // Force cache refresh by adding timestamp to URL
+                const forceNoCache = new Date().getTime();
+                console.log(`Adding cache-busting parameter: ${forceNoCache}`);
+                
+                // Log all URL parameters
+                console.log("URL parameters:", Object.fromEntries([...urlParams.entries()]));
+                
+                // Clear all storage immediately
+                clearAllStorage();
+                
+                // Try calling the browser's Clear-Site-Data API if available
+                try {
+                    if ('navigate' in window && 'clearSiteData' in window.navigation) {
+                        console.log("Using modern clearSiteData API");
+                        window.navigation.clearSiteData({
+                            types: ['cookies', 'storage', 'cache']
+                        });
+                    }
+                } catch (e) {
+                    console.warn("Error using clearSiteData API:", e);
+                }
+                
+                // If we came from a complete IdP logout, do additional cleanup
+                if (isComplete === 'true') {
+                    console.log("Complete IdP logout detected, performing deep cleanup");
+                    
+                    // Try to clear third-party cookies
+                    try {
+                        if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+                            navigator.serviceWorker.controller.postMessage({
+                                type: 'CLEAR_AUTH_STATE'
+                            });
+                            console.log("Sent clear message to service worker");
+                        }
+                    } catch (e) {
+                        console.warn("Error clearing service worker state:", e);
+                    }
+                    
+                    // Try to clear application cache
+                    if ('caches' in window) {
+                        caches.keys().then(function(keyList) {
+                            console.log("Clearing caches:", keyList);
+                            return Promise.all(keyList.map(function(key) {
+                                return caches.delete(key);
+                            }));
+                        }).then(() => {
+                            console.log("All caches cleared successfully");
+                        }).catch(err => {
+                            console.error("Error clearing caches:", err);
+                        });
+                    }
+                    
+                    // Clear provider-specific tokens
+                    const providerType = urlParams.get('provider_type');
+                    console.log("Detected provider type from URL:", providerType);
+                    
+                    if (providerType === 'cognito') {
+                        // Clear Cognito specific storage
+                        console.log("Clearing Cognito-specific tokens");
+                        Object.keys(localStorage).forEach(key => {
+                            if (key.includes('CognitoIdentityServiceProvider') || 
+                                key.includes('cognito') || 
+                                key.includes('aws.cognito')) {
+                                console.log("Removing Cognito localStorage key:", key);
+                                localStorage.removeItem(key);
+                            }
+                        });
+                    } else if (providerType === 'azure') {
+                        // Clear Azure AD specific storage
+                        console.log("Clearing Azure AD-specific tokens");
+                        Object.keys(localStorage).forEach(key => {
+                            if (key.includes('msal.') || 
+                                key.includes('azure') || 
+                                key.includes('microsoft')) {
+                                console.log("Removing Azure AD localStorage key:", key);
+                                localStorage.removeItem(key);
+                            }
+                        });
+                    } else if (providerType === 'auth0') {
+                        // Clear Auth0 specific storage
+                        console.log("Clearing Auth0-specific tokens");
+                        Object.keys(localStorage).forEach(key => {
+                            if (key.includes('auth0') || key.includes('a0.spajs')) {
+                                console.log("Removing Auth0 localStorage key:", key);
+                                localStorage.removeItem(key);
+                            }
+                        });
+                    } else if (providerType === 'okta') {
+                        // Clear Okta specific storage
+                        console.log("Clearing Okta-specific tokens");
+                        Object.keys(localStorage).forEach(key => {
+                            if (key.includes('okta') || key.includes('oauth2')) {
+                                console.log("Removing Okta localStorage key:", key);
+                                localStorage.removeItem(key);
+                            }
+                        });
+                    }
+                    
+                    // For increased reliability, force a page reload after deep cleanup
+                    setTimeout(() => {
+                        console.log("Performing forced page reload for complete cleanup");
+                        window.location.reload(true); // true forces reload from server, not cache
+                    }, 500);
+                }
+                
+                // Force page reload after a short delay if we still have cookies
+                // This helps with stubborn cookies that might not be cleared properly
+                if (document.cookie) {
+                    console.log("Still have cookies after cleanup, will force reload");
+                    setTimeout(function() {
+                        // Keep the timestamp but remove other parameters to avoid infinite reload loop
+                        const t = urlParams.get('t');
+                        urlParams.delete('signed_out');
+                        urlParams.delete('complete');
+                        urlParams.delete('nonce');
+                        urlParams.delete('error');
+                        if (t) urlParams.set('t', t);
+                        
+                        let newUrl = window.location.pathname;
+                        if (urlParams.toString()) {
+                            newUrl += '?' + urlParams.toString();
+                        }
+                        window.location.href = newUrl; // Hard reload
+                    }, 250);
+                } else {
+                    // Remove the signed_out parameter from URL to prevent re-clearing on refresh
+                    const t = urlParams.get('t');
+                    urlParams.delete('signed_out');
+                    urlParams.delete('complete');
+                    urlParams.delete('nonce');
+                    urlParams.delete('error');
+                    if (t) urlParams.set('t', t);
+                    
+                    let newUrl = window.location.pathname;
+                    if (urlParams.toString()) {
+                        newUrl += '?' + urlParams.toString();
+                    }
+                    
+                    // Replace the URL without reloading the page
+                    window.history.replaceState({}, document.title, newUrl);
+                }
+                
+                // Display logout success message if not already displayed
+                if (!document.getElementById('logout-message')) {
+                    const loginContainer = document.querySelector('.login-container');
+                    if (loginContainer) {
+                        const message = document.createElement('div');
+                        message.id = 'logout-message';
+                        message.className = 'alert alert-success';
+                        message.style.marginBottom = '20px';
+                        message.style.padding = '10px';
+                        message.style.borderRadius = '4px';
+                        message.style.backgroundColor = '#d4edda';
+                        message.style.color = '#155724';
+                        message.style.border = '1px solid #c3e6cb';
+                        message.innerHTML = 'You have been successfully logged out.';
+                        loginContainer.insertBefore(message, loginContainer.firstChild);
+                    }
+                }
+            } else {
+                // Always do a basic cleanup on login page to be safe
+                clearAllStorage();
+            }
+            
+            // Add a beforeunload listener to try one last cookie clear before page navigations
+            window.addEventListener('beforeunload', function() {
+                // Quick final cookie clear attempt
+                try {
+                    document.cookie.split(";").forEach(function(c) {
+                        document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/");
+                    });
+                } catch(e) {}
+            });
+        };
+    </script>
 </head>
 <body class="login-body">
 
     <div class="login-container">
         <div class="login-header">
-             <img src="{{ url_for('static', path='/logo.png') }}" alt="MCP Gateway Logo" height="40" style="margin-bottom: 15px;"> <!-- Logo Image -->
+             <img src="{{ url_for('static', path='/logo.png') }}" alt="MCP Gateway Logo" height="40" style="margin-bottom: 15px;">
             <h2>Admin Login</h2>
         </div>
 
@@ -18,6 +336,19 @@
         <p class="error-message">{{ error }}</p>
         {% endif %}
 
+        {% if oauth_enabled %}
+        <!-- OAuth login only when enabled - include timestamp to prevent caching -->
+        <a href="/oauth/login?t={{ timestamp|default('1') }}" class="btn-oauth 
+            {% if provider_type == 'cognito' %}btn-cognito{% endif %}
+            {% if provider_type == 'okta' %}btn-okta{% endif %}
+            {% if provider_type == 'azure' %}btn-azure{% endif %}
+            {% if provider_type == 'google' %}btn-google{% endif %}
+            {% if provider_type == 'auth0' %}btn-auth0{% endif %}
+        ">
+            Sign in with {{ provider_type|title if provider_type else 'OAuth' }}
+        </a>
+        {% else %}
+        <!-- Standard form login only when OAuth is not enabled -->
         <form action="/login" method="post">
             <div class="form-group">
                 <label for="username">Username</label>
@@ -29,8 +360,72 @@
             </div>
             <button type="submit">Login</button>
         </form>
-        <!-- Add link to OAuth providers here later if implemented -->
+        {% endif %}
     </div>
 
+    <style>
+        .btn-oauth {
+            display: block;
+            padding: 15px 25px;
+            margin: 20px auto 0;
+            background-color: #333;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            font-weight: 500;
+            cursor: pointer;
+            text-align: center;
+            text-decoration: none;
+            transition: background-color 0.2s;
+            max-width: 300px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+        
+        .btn-oauth:hover {
+            background-color: #555;
+            box-shadow: 0 3px 7px rgba(0,0,0,0.3);
+        }
+        
+        .btn-cognito {
+            background-color: #ff9900;
+        }
+        
+        .btn-cognito:hover {
+            background-color: #e68a00;
+        }
+        
+        .btn-okta {
+            background-color: #007dc1;
+        }
+        
+        .btn-okta:hover {
+            background-color: #006ba7;
+        }
+        
+        .btn-azure {
+            background-color: #0072c6;
+        }
+        
+        .btn-azure:hover {
+            background-color: #005da3;
+        }
+        
+        .btn-google {
+            background-color: #4285F4;
+        }
+        
+        .btn-google:hover {
+            background-color: #2a75f3;
+        }
+        
+        .btn-auth0 {
+            background-color: #eb5424;
+        }
+        
+        .btn-auth0:hover {
+            background-color: #d44a1e;
+        }
+    </style>
 </body>
-</html> 
+</html>
