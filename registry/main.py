@@ -43,6 +43,11 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+# Custom exception for redirecting to login
+class RedirectToLogin(Exception):
+    """Exception raised when user needs to be redirected to login page."""
+    pass
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 from dotenv import load_dotenv
 import logging
@@ -632,6 +637,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Add exception handler for RedirectToLogin
+@app.exception_handler(RedirectToLogin)
+async def redirect_to_login_handler(request: Request, exc: RedirectToLogin):
+    """Handle RedirectToLogin exception by redirecting to login page."""
+    logger.info(f"Redirecting unauthenticated user to login page from {request.url.path}")
+    return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+
 # Mount static files directory
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -680,6 +692,22 @@ def is_session_logged_out(session_data: dict) -> bool:
         return logout_time > login_timestamp
     except (ValueError, AttributeError):
         return False
+
+def handle_auth_failure(request: Request, detail: str):
+    """Handle authentication failure by redirecting browser requests or raising HTTPException for API requests."""
+    accept_header = request.headers.get("accept", "")
+    is_browser_request = "text/html" in accept_header
+    
+    if is_browser_request:
+        logger.info(f"Browser request detected, redirecting to login page. Reason: {detail}")
+        raise RedirectToLogin()
+    else:
+        logger.info(f"API request detected, returning 401. Reason: {detail}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=detail,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 def validate_secret_key(secret_key: str) -> None:
     """
@@ -737,7 +765,7 @@ def validate_secret_key(secret_key: str) -> None:
     logger.info("SECRET_KEY validation passed - key meets security requirements")
 
 def get_current_user(request: Request, session: str = Cookie(None)) -> str:
-    """Get the current user from session cookie, or return 'anonymous'."""
+    """Get the current user from session cookie, or redirect to login for browser requests."""
     SECRET_KEY = os.environ.get("SECRET_KEY", "insecure-default-key-for-testing-only")
     
     # Validate SECRET_KEY strength before using it for authentication
@@ -775,14 +803,10 @@ def get_current_user(request: Request, session: str = Cookie(None)) -> str:
         session = request.cookies[session_cookie_name]
         logger.info(f"Using session from request.cookies: {session[:20]}...")
         
-    # No session? Redirect to login
+    # No session? Use helper function to handle browser vs API requests
     if not session:
-        logger.warning("No session cookie found. Redirecting to login.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        logger.warning("No session cookie found.")
+        handle_auth_failure(request, "Not authenticated")
 
     # Unsign the cookie
     try:
@@ -794,7 +818,7 @@ def get_current_user(request: Request, session: str = Cookie(None)) -> str:
         if is_session_logged_out(data):
             fingerprint = get_session_fingerprint(data)
             logger.warning(f"Session {fingerprint} was logged out after creation")
-            raise HTTPException(status_code=401, detail="Session has been logged out")
+            handle_auth_failure(request, "Session has been logged out")
         
         # If OAuth session
         if data.get("is_oauth", False):
@@ -832,16 +856,16 @@ def get_current_user(request: Request, session: str = Cookie(None)) -> str:
             return username
             
         logger.warning(f"Session found but invalid structure: {data}")
-        raise HTTPException(status_code=401, detail="Invalid session")
+        handle_auth_failure(request, "Invalid session")
     except SignatureExpired:
         logger.warning("Session expired")
-        raise HTTPException(status_code=401, detail="Session expired")
+        handle_auth_failure(request, "Session expired")
     except BadSignature:
         logger.warning("Invalid session signature")
-        raise HTTPException(status_code=401, detail="Invalid session")
+        handle_auth_failure(request, "Invalid session")
     except Exception as e:
         logger.error(f"Error validating session: {e}")
-        raise HTTPException(status_code=401, detail="Authentication error")
+        handle_auth_failure(request, "Authentication error")
 
 
 def api_auth(request: Request, session: str = Cookie(None)) -> str:
