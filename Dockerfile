@@ -25,6 +25,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock /app/
 
 # Create the shared virtual environment that start_all_servers.sh will use
+RUN pip install uv
 RUN uv venv /app/.venv --python 3.12
 
 # Install dependencies directly from pyproject.toml

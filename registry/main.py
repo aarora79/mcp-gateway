@@ -886,8 +886,14 @@ async def login(
     except ValueError as e:
         logger.error(f"SECRET_KEY validation failed during login: {e}")
         return templates.TemplateResponse(
-            "login.html", 
-            {"request": request, "error": "Server configuration error. Please contact administrator."}
+            "login.html",
+            {
+                "request": request,
+                "error": "Server configuration error. Please contact administrator.",
+                "user_has_toggle_scope": lambda server_path: user_has_toggle_scope(request, server_path),
+                "user_has_edit_scope": lambda server_path: user_has_edit_scope(request, server_path),
+                "user_has_admin_scope": lambda: user_has_admin_scope(request)
+            }
         )
     
     session_cookie_name = "mcp_gateway_session"
@@ -918,7 +924,13 @@ async def login(
         # Show login form with error
         return templates.TemplateResponse(
             "login.html",
-            {"request": request, "error": "Invalid username or password"},
+            {
+                "request": request,
+                "error": "Invalid username or password",
+                "user_has_toggle_scope": lambda server_path: user_has_toggle_scope(request, server_path),
+                "user_has_edit_scope": lambda server_path: user_has_edit_scope(request, server_path),
+                "user_has_admin_scope": lambda: user_has_admin_scope(request)
+            },
         )
 
 
@@ -1126,9 +1138,12 @@ async def index(request: Request, username: Annotated[str, Depends(get_current_u
     
     return templates.TemplateResponse(
         "index.html", {
-            "request": request, 
-            "services": service_data, 
-            "username": username
+            "request": request,
+            "services": service_data,
+            "username": username,
+            "user_has_toggle_scope": lambda server_path: user_has_toggle_scope(request, server_path),
+            "user_has_edit_scope": lambda server_path: user_has_edit_scope(request, server_path),
+            "user_has_admin_scope": lambda: user_has_admin_scope(request)
         }
     )
 
@@ -1136,14 +1151,26 @@ async def index(request: Request, username: Annotated[str, Depends(get_current_u
 async def debug_index(request: Request, username: Annotated[str, Depends(get_current_user)]):
     """Render the debug page for diagnostic purposes."""
     return templates.TemplateResponse(
-        "debug_index.html", {"request": request, "username": username}
+        "debug_index.html", {
+            "request": request,
+            "username": username,
+            "user_has_toggle_scope": lambda server_path: user_has_toggle_scope(request, server_path),
+            "user_has_edit_scope": lambda server_path: user_has_edit_scope(request, server_path),
+            "user_has_admin_scope": lambda: user_has_admin_scope(request)
+        }
     )
 
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_form(request: Request, error: str = None):
     """Render the login form."""
-    return templates.TemplateResponse("login.html", {"request": request, "error": error})
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "error": error,
+        "user_has_toggle_scope": lambda server_path: user_has_toggle_scope(request, server_path),
+        "user_has_edit_scope": lambda server_path: user_has_edit_scope(request, server_path),
+        "user_has_admin_scope": lambda: user_has_admin_scope(request)
+    })
 
 
 @app.get("/api/servers")
@@ -1380,6 +1407,42 @@ def regenerate_nginx_config():
     }}"""
         dynamic_locations.append(streamable_location)
 
+        # Combine all parts
+        new_config = before_dynamic + "\n".join(dynamic_locations) + after_dynamic
+        
+        # Write the new configuration
+        try:
+            with open(NGINX_CONFIG_PATH, "w") as f:
+                f.write(new_config)
+            logger.info(f"Nginx configuration updated at {NGINX_CONFIG_PATH}")
+            
+            # Reload Nginx if possible
+            try:
+                logger.info("Attempting to reload Nginx configuration...")
+                result = subprocess.run(['/usr/sbin/nginx', '-s', 'reload'], capture_output=True, text=True)
+                if result.returncode == 0:
+                    logger.info(f"Nginx reload successful. stdout: {result.stdout.strip()}")
+                    return True
+            except FileNotFoundError:
+                logger.error("'nginx' command not found. Cannot reload configuration.")
+                return False
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to reload Nginx configuration. Return code: {e.returncode}")
+                logger.error(f"Nginx reload stderr: {e.stderr.strip()}")
+                logger.error(f"Nginx reload stdout: {e.stdout.strip()}")
+                return False
+            except Exception as e:
+                logger.error(f"An unexpected error occurred during Nginx reload: {e}", exc_info=True)
+                return False
+            # --- Reload Nginx --- END
+
+        except FileNotFoundError:
+            logger.error(f"Target Nginx config file not found at {NGINX_CONFIG_PATH}. Cannot regenerate.")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to modify Nginx config at {NGINX_CONFIG_PATH}: {e}", exc_info=True)
+            return False
+
 COMMENTED_LOCATION_BLOCK_TEMPLATE = """
 #    location {path}/ {{
 #        proxy_pass {proxy_pass_url};
@@ -1391,47 +1454,6 @@ COMMENTED_LOCATION_BLOCK_TEMPLATE = """
 #    }}
 """
 
-def regenerate_nginx_config():
-    """Generates the nginx config file based on registered servers and their state."""
-    logger.info(f"Attempting to directly modify Nginx config at {NGINX_CONFIG_PATH}...")
-    
-    dynamic_locations.append(end_marker)
-    
-    # Combine all parts
-    new_config = before_dynamic + "\n".join(dynamic_locations) + after_dynamic
-    
-    # Write the new configuration
-    try:
-        with open(NGINX_CONFIG_PATH, "w") as f:
-            f.write(new_config)
-        logger.info(f"Nginx configuration updated at {NGINX_CONFIG_PATH}")
-        
-        # Reload Nginx if possible
-        try:
-            logger.info("Attempting to reload Nginx configuration...")
-            result = subprocess.run(['/usr/sbin/nginx', '-s', 'reload'], capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info(f"Nginx reload successful. stdout: {result.stdout.strip()}")
-                return True
-        except FileNotFoundError:
-            logger.error("'nginx' command not found. Cannot reload configuration.")
-            return False
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to reload Nginx configuration. Return code: {e.returncode}")
-            logger.error(f"Nginx reload stderr: {e.stderr.strip()}")
-            logger.error(f"Nginx reload stdout: {e.stdout.strip()}")
-            return False
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during Nginx reload: {e}", exc_info=True)
-            return False
-        # --- Reload Nginx --- END
-
-    except FileNotFoundError:
-        logger.error(f"Target Nginx config file not found at {NGINX_CONFIG_PATH}. Cannot regenerate.")
-        return False
-    except Exception as e:
-        logger.error(f"Failed to modify Nginx config at {NGINX_CONFIG_PATH}: {e}", exc_info=True)
-        return False
 
 # --- Helper function to normalize a path to a filename ---
 def path_to_filename(path):
@@ -2612,8 +2634,15 @@ async def edit_server_form(
         raise HTTPException(status_code=404, detail="Service path not found")
     
     return templates.TemplateResponse(
-        "edit_server.html", 
-        {"request": request, "server": server_info, "username": username}
+        "edit_server.html",
+        {
+            "request": request,
+            "server": server_info,
+            "username": username,
+            "user_has_toggle_scope": lambda server_path: user_has_toggle_scope(request, server_path),
+            "user_has_edit_scope": lambda server_path: user_has_edit_scope(request, server_path),
+            "user_has_admin_scope": lambda: user_has_admin_scope(request)
+        }
     )
 
 @app.post("/edit/{service_path:path}")
@@ -2775,52 +2804,43 @@ if __name__ == "__main__":
     # Get port from environment variable or use default
     port = int(os.environ.get("REGISTRY_PORT", 7860))
     uvicorn.run(app, host="0.0.0.0", port=port)
-@app.context_processor
-def utility_processor():
-    """Add utility functions to Jinja2 templates."""
-    def user_has_toggle_scope(server_path):
-        """Check if the current user has toggle permission for a server."""
-        if not hasattr(request.state, "user") or not hasattr(request.state.user, "has_scope"):
-            return False
-            
-        auth_settings = AuthSettings()
+# Helper functions for template context
+def user_has_toggle_scope(request, server_path):
+    """Check if the current user has toggle permission for a server."""
+    if not hasattr(request.state, "user") or not hasattr(request.state.user, "has_scope"):
+        return False
         
-        # Admin scope grants all permissions
-        if request.state.user.has_scope(auth_settings.registry_admin_scope):
-            return True
-            
-        # Check for server-specific toggle scope
-        base_scope = auth_settings.server_execute_scope_prefix + server_path.lstrip("/")
-        toggle_scope = f"{base_scope}:toggle"
-        return request.state.user.has_scope(toggle_scope)
+    auth_settings = AuthSettings()
+    
+    # Admin scope grants all permissions
+    if request.state.user.has_scope(auth_settings.registry_admin_scope):
+        return True
         
-    def user_has_edit_scope(server_path):
-        """Check if the current user has edit permission for a server."""
-        if not hasattr(request.state, "user") or not hasattr(request.state.user, "has_scope"):
-            return False
-            
-        auth_settings = AuthSettings()
+    # Check for server-specific toggle scope
+    base_scope = auth_settings.server_execute_scope_prefix + server_path.lstrip("/")
+    toggle_scope = f"{base_scope}:toggle"
+    return request.state.user.has_scope(toggle_scope)
+    
+def user_has_edit_scope(request, server_path):
+    """Check if the current user has edit permission for a server."""
+    if not hasattr(request.state, "user") or not hasattr(request.state.user, "has_scope"):
+        return False
         
-        # Admin scope grants all permissions
-        if request.state.user.has_scope(auth_settings.registry_admin_scope):
-            return True
-            
-        # Check for server-specific edit scope
-        base_scope = auth_settings.server_execute_scope_prefix + server_path.lstrip("/")
-        edit_scope = f"{base_scope}:edit"
-        return request.state.user.has_scope(edit_scope)
+    auth_settings = AuthSettings()
+    
+    # Admin scope grants all permissions
+    if request.state.user.has_scope(auth_settings.registry_admin_scope):
+        return True
         
-    def user_has_admin_scope():
-        """Check if the current user has admin scope."""
-        if not hasattr(request.state, "user") or not hasattr(request.state.user, "has_scope"):
-            return False
-            
-        auth_settings = AuthSettings()
-        return request.state.user.has_scope(auth_settings.registry_admin_scope)
+    # Check for server-specific edit scope
+    base_scope = auth_settings.server_execute_scope_prefix + server_path.lstrip("/")
+    edit_scope = f"{base_scope}:edit"
+    return request.state.user.has_scope(edit_scope)
+    
+def user_has_admin_scope(request):
+    """Check if the current user has admin scope."""
+    if not hasattr(request.state, "user") or not hasattr(request.state.user, "has_scope"):
+        return False
         
-    return {
-        "user_has_toggle_scope": user_has_toggle_scope,
-        "user_has_edit_scope": user_has_edit_scope,
-        "user_has_admin_scope": user_has_admin_scope
-    }
-# Remove function definition from the bottom of the file as we'll move it to the top
+    auth_settings = AuthSettings()
+    return request.state.user.has_scope(auth_settings.registry_admin_scope)
