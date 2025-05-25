@@ -958,6 +958,54 @@ async def login(
         )
 
 
+def get_idp_logout_url_fast(provider_type: str, request: Request) -> str:
+    """Generate IdP logout URL in a provider-agnostic way (optimized for speed)."""
+    try:
+        # Quick check for Cognito without heavy AuthSettings initialization
+        if provider_type == "cognito":
+            cognito_domain = os.environ.get("MCP_AUTH_COGNITO_DOMAIN")
+            client_id = os.environ.get("MCP_AUTH_CLIENT_ID")
+            
+            if cognito_domain and client_id:
+                timestamp = int(datetime.now(timezone.utc).timestamp())
+                scheme = request.url.scheme or "http"
+                host = request.headers.get('host', 'localhost:7860')
+                return_uri = f"{scheme}://{host}/login?t={timestamp}&signed_out=true&complete=true"
+                logout_url = f"https://{cognito_domain}/logout?client_id={client_id}&logout_uri={urllib.parse.quote(return_uri)}"
+                return logout_url
+        
+        # For other providers, fall back to the original function if needed
+        # but for now, just return None to avoid blocking
+        return None
+        
+    except Exception:
+        # Fail silently to avoid blocking logout
+        return None
+
+def get_idp_logout_url_fast(provider_type: str, request: Request) -> str:
+    """Generate IdP logout URL in a provider-agnostic way (optimized for speed)."""
+    try:
+        # Quick check for Cognito without heavy AuthSettings initialization
+        if provider_type == "cognito":
+            cognito_domain = os.environ.get("MCP_AUTH_COGNITO_DOMAIN")
+            client_id = os.environ.get("MCP_AUTH_CLIENT_ID")
+            
+            if cognito_domain and client_id:
+                timestamp = int(datetime.now(timezone.utc).timestamp())
+                scheme = request.url.scheme or "http"
+                host = request.headers.get('host', 'localhost:7860')
+                return_uri = f"{scheme}://{host}/login?t={timestamp}&signed_out=true&complete=true"
+                logout_url = f"https://{cognito_domain}/logout?client_id={client_id}&logout_uri={urllib.parse.quote(return_uri)}"
+                return logout_url
+        
+        # For other providers, fall back to the original function if needed
+        # but for now, just return None to avoid blocking
+        return None
+        
+    except Exception:
+        # Fail silently to avoid blocking logout
+        return None
+
 def get_idp_logout_url(provider_type: str, request: Request) -> str:
     """Generate IdP logout URL in a provider-agnostic way."""
     logger.info(f"Generating IdP logout URL for provider: {provider_type}")
@@ -1005,16 +1053,11 @@ async def logout_get(request: Request):
     Log out by clearing the session cookie and invalidating the session server-side.
     Provides IdP logout URLs when available.
     """
-    logger.info("Logout initiated")
-    
     session_cookie_name = "mcp_gateway_session"
     SECRET_KEY = os.environ.get("SECRET_KEY", "insecure-default-key-for-testing-only")
     
     # Extract session cookie manually (same approach as get_current_user)
     session = request.cookies.get(session_cookie_name)
-    logger.info(f"Logout - session cookie present: {session is not None}")
-    if session:
-        logger.info(f"Session cookie value: {session[:50]}...")
     
     # Decode session and invalidate server-side
     provider_type = None
@@ -1032,9 +1075,11 @@ async def logout_get(request: Request):
             fingerprint = get_session_fingerprint(session_data)
             SESSION_LOGOUT_TIMES[fingerprint] = time.time()
             session_invalidated = True
-            cleanup_logout_times()  # Clean up if needed
             
-            logger.info(f"Session logout - User: {username}, Provider: {provider_type}, Fingerprint: {fingerprint}")
+            # Only cleanup if we have too many entries (avoid unnecessary work)
+            if len(SESSION_LOGOUT_TIMES) > MAX_LOGOUT_ENTRIES:
+                cleanup_logout_times()
+            
         except Exception as e:
             logger.warning(f"Error decoding session during logout: {e}")
     
@@ -1042,15 +1087,16 @@ async def logout_get(request: Request):
     timestamp = int(datetime.now(timezone.utc).timestamp())
     logout_url = f"/login?t={timestamp}&signed_out=true"
     
-    # Add IdP logout URL if available
+    # Add IdP logout URL if available (but don't block on it)
     if provider_type:
-        idp_logout_url = get_idp_logout_url(provider_type, request)
-        logger.info(f"Generated IdP logout URL for {provider_type}: {idp_logout_url}")
-        if idp_logout_url:
-            logout_url += f"&idp_logout={urllib.parse.quote(idp_logout_url)}"
-        logout_url += f"&provider_type={provider_type}"
-    
-    logger.info(f"Final logout redirect URL: {logout_url}")
+        try:
+            idp_logout_url = get_idp_logout_url_fast(provider_type, request)
+            if idp_logout_url:
+                logout_url += f"&idp_logout={urllib.parse.quote(idp_logout_url)}"
+            logout_url += f"&provider_type={provider_type}"
+        except Exception:
+            # Don't let IdP logout URL generation block the logout - fail silently
+            pass
     
     response = RedirectResponse(url=logout_url, status_code=status.HTTP_303_SEE_OTHER)
     
@@ -1059,9 +1105,12 @@ async def logout_get(request: Request):
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
-    response.headers['Clear-Site-Data'] = '"cookies", "storage", "cache"'
+    # Removed Clear-Site-Data header to improve logout performance
     
-    logger.info(f"Logout completed for user: {username}, server-side invalidation: {session_invalidated}")
+    # Log completion with minimal info
+    if username:
+        logger.debug(f"Logout completed for user: {username}")
+    
     return response
 
 @app.post("/logout")
