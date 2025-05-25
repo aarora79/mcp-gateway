@@ -1407,41 +1407,48 @@ def regenerate_nginx_config():
     }}"""
         dynamic_locations.append(streamable_location)
 
-        # Combine all parts
-        new_config = before_dynamic + "\n".join(dynamic_locations) + after_dynamic
+    # Add the end marker
+    dynamic_locations.append(end_marker)
+    
+    # Combine all parts
+    new_config = before_dynamic + "\n".join(dynamic_locations) + after_dynamic
+    
+    # Write the new configuration
+    try:
+        with open(NGINX_CONFIG_PATH, "w") as f:
+            f.write(new_config)
+        logger.info(f"Nginx configuration updated at {NGINX_CONFIG_PATH}")
         
-        # Write the new configuration
+        # Reload Nginx if possible
         try:
-            with open(NGINX_CONFIG_PATH, "w") as f:
-                f.write(new_config)
-            logger.info(f"Nginx configuration updated at {NGINX_CONFIG_PATH}")
-            
-            # Reload Nginx if possible
-            try:
-                logger.info("Attempting to reload Nginx configuration...")
-                result = subprocess.run(['/usr/sbin/nginx', '-s', 'reload'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    logger.info(f"Nginx reload successful. stdout: {result.stdout.strip()}")
-                    return True
-            except FileNotFoundError:
-                logger.error("'nginx' command not found. Cannot reload configuration.")
+            logger.info("Attempting to reload Nginx configuration...")
+            result = subprocess.run(['/usr/sbin/nginx', '-s', 'reload'], capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info(f"Nginx reload successful. stdout: {result.stdout.strip()}")
+                return True
+            else:
+                logger.error(f"Failed to reload Nginx configuration. Return code: {result.returncode}")
+                logger.error(f"Nginx reload stderr: {result.stderr.strip()}")
+                logger.error(f"Nginx reload stdout: {result.stdout.strip()}")
                 return False
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to reload Nginx configuration. Return code: {e.returncode}")
-                logger.error(f"Nginx reload stderr: {e.stderr.strip()}")
-                logger.error(f"Nginx reload stdout: {e.stdout.strip()}")
-                return False
-            except Exception as e:
-                logger.error(f"An unexpected error occurred during Nginx reload: {e}", exc_info=True)
-                return False
-            # --- Reload Nginx --- END
-
         except FileNotFoundError:
-            logger.error(f"Target Nginx config file not found at {NGINX_CONFIG_PATH}. Cannot regenerate.")
+            logger.error("'nginx' command not found. Cannot reload configuration.")
+            return False
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to reload Nginx configuration. Return code: {e.returncode}")
+            logger.error(f"Nginx reload stderr: {e.stderr.strip()}")
+            logger.error(f"Nginx reload stdout: {e.stdout.strip()}")
             return False
         except Exception as e:
-            logger.error(f"Failed to modify Nginx config at {NGINX_CONFIG_PATH}: {e}", exc_info=True)
+            logger.error(f"An unexpected error occurred during Nginx reload: {e}", exc_info=True)
             return False
+
+    except FileNotFoundError:
+        logger.error(f"Target Nginx config file not found at {NGINX_CONFIG_PATH}. Cannot regenerate.")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to modify Nginx config at {NGINX_CONFIG_PATH}: {e}", exc_info=True)
+        return False
 
 COMMENTED_LOCATION_BLOCK_TEMPLATE = """
 #    location {path}/ {{
