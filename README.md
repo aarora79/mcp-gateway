@@ -233,18 +233,18 @@ The Gateway and the Registry are available as a Docker container. The package in
 1. **View MCP server metadata:**
    Metadata about all MCP servers connected to the Registry is available in `/opt/mcp-gateway/servers` directory. The metadata includes information gathered from `ListTools` as well as information provided while registering the server.
 
+1. **Test the Gateway and Registry with the sample Agent and test suite**
+   The repo includes a test agent that can connect to the Registry to discover tools and invoke them to do interesting tasks. This functionality can be invoked either standalone or as part of a test suite.
+   
    ```{.python}
    python agents\agent.py --mcp-registry-url http://localhost/mcpgw/sse --message "what is the current time in clarksburg, md"
    ```
 
    You can also run the full test suite and get a handy agent evaluation report. This test suite exercises the Registry functionality as well as tests the multiple built-in MCP servers provided by the Gateway.
    ```{python}
-   python agents\test_suite.py
+   python agents/test_suite.py
    ```
    The result of the tests suites are available in the `agents/test_results` folder. It contains an `accuracy.json`, a `summary.json`, a `logs` folder and a `raw_data` folder that contains the verbose output from the agent. The test suite uses an LLM as a judge to evaluate the results for accuracy and tool usage quality.
-
-1. **Test the Gateway and Registry with the sample Agent and test suite**
-   The repo includes a test agent that can connect to the Registry to discover tools and invoke them to do interesting tasks. This functionality can be invoked either standalone or as part of a test suite.
 
 #### Running the Gateway over HTTPS
 
