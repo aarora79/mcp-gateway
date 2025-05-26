@@ -1273,6 +1273,7 @@ async def list_servers(
 def regenerate_nginx_config():
     """
     Regenerate the Nginx configuration file to include all enabled services.
+    Updates both HTTP (port 80) and HTTPS (port 443) server blocks.
     Returns True if successful, False otherwise.
     """
     # Load the existing config file to preserve non-dynamic parts
@@ -1319,29 +1320,6 @@ def regenerate_nginx_config():
         proxy_set_header Cookie $http_cookie;
     }
 """
-    
-    try:
-        # Handle the single set of markers in the HTTP server
-        parts = existing_config.split(start_marker, 1)  # Split on first occurrence only
-        if len(parts) < 2:
-            logger.error("Failed to find start marker in Nginx config")
-            return False
-            
-        before_dynamic = parts[0]
-        remaining = parts[1]
-        
-        parts = remaining.split(end_marker, 1)  # Split on first occurrence only
-        if len(parts) < 2:
-            logger.error("Failed to find end marker after start marker in Nginx config")
-            return False
-            
-        after_dynamic = parts[1]
-        
-        # Log the positions for debugging
-        logger.info(f"Found dynamic markers in Nginx config: {len(before_dynamic)} chars before, {len(after_dynamic)} chars after")
-    except Exception as e:
-        logger.error(f"Failed to find dynamic location markers in Nginx config: {e}")
-        return False
     
     # Build configuration for each enabled service
     dynamic_locations = []
@@ -1406,8 +1384,55 @@ def regenerate_nginx_config():
     # Add the end marker
     dynamic_locations.append(end_marker)
     
-    # Combine all parts
-    new_config = before_dynamic + "\n".join(dynamic_locations) + after_dynamic
+    # Generate the dynamic content as a string
+    dynamic_content = "\n".join(dynamic_locations)
+    
+    # Generate the dynamic content as a string
+    dynamic_content = "\n".join(dynamic_locations)
+    
+    # Find all occurrences of start and end markers
+    start_positions = []
+    end_positions = []
+    start_pos = 0
+    
+    # Find all start markers
+    while True:
+        start_pos = existing_config.find(start_marker, start_pos)
+        if start_pos == -1:
+            break
+        start_positions.append(start_pos)
+        start_pos += len(start_marker)
+    
+    # Find all end markers
+    end_pos = 0
+    while True:
+        end_pos = existing_config.find(end_marker, end_pos)
+        if end_pos == -1:
+            break
+        end_positions.append(end_pos + len(end_marker))
+        end_pos += len(end_marker)
+    
+    # Verify we have matching pairs of markers
+    if len(start_positions) != len(end_positions) or len(start_positions) == 0:
+        logger.error(f"Mismatched or missing markers: {len(start_positions)} starts, {len(end_positions)} ends")
+        return False
+    
+    # Sort positions to ensure correct order
+    start_positions.sort()
+    end_positions.sort()
+    
+    # Build new config by replacing each section
+    new_config = existing_config
+    
+    # Replace sections in reverse order to avoid position shifts
+    for i in range(len(start_positions) - 1, -1, -1):
+        start_pos = start_positions[i]
+        end_pos = end_positions[i]
+        
+        # Replace this section with dynamic content
+        new_config = new_config[:start_pos] + dynamic_content + new_config[end_pos:]
+    
+    logger.info(f"Updated {len(start_positions)} dynamic sections in Nginx config")
     
     # Write the new configuration
     try:
