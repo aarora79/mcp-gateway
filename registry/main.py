@@ -21,6 +21,11 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
+
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+
 # Get configuration from environment variables
 EMBEDDINGS_MODEL_NAME = os.environ.get('EMBEDDINGS_MODEL_NAME', 'all-MiniLM-L6-v2')
 EMBEDDINGS_MODEL_DIMENSIONS = int(os.environ.get('EMBEDDINGS_MODEL_DIMENSIONS', '384'))
@@ -1396,89 +1401,7 @@ def regenerate_nginx_config():
     }}"""
         dynamic_locations.append(nginx_location)
         
-        # 2. Additional location block for the /api/execute/{service} endpoint
-        # Create location block for Server-Sent Events (SSE) transport
-        sse_location = f"""
-    # --- MCP Protocol: Server-Sent Events (SSE) Endpoint ---
-    location /api/execute/{safe_path} {{
-        # First check auth via our MCP Gateway service
-        auth_request /api/tool_auth/{safe_path};
-        
-        # Then proxy directly to the SSE endpoint of the target service
-        proxy_pass {proxy_url.rstrip('/')}/sse;
-        proxy_http_version 1.1;
-        
-        # Required headers for Server-Sent Events
-        proxy_set_header Connection "";
-        proxy_buffering off;
-        
-        # Important timing settings for SSE
-        proxy_read_timeout 600s;
-        proxy_connect_timeout 10s;
-        proxy_send_timeout 10s;
-        
-        # Standard proxy headers
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # Handle content negotiation
-        proxy_set_header Accept "text/event-stream, application/json";
-        
-        # Pass through authentication headers for service-specific tokens
-        proxy_pass_request_headers on;
-        proxy_set_header X-Service-Auth-Github $http_x_service_auth_github;
-        proxy_set_header X-Service-Auth-AWS $http_x_service_auth_aws;
-        proxy_set_header X-Service-Auth-Token $http_x_service_auth_token;
-        
-        # Handle auth errors
-        error_page 401 403 = @error401;
-        error_page 404 = @error404;
-        error_page 500 502 503 504 = @error5xx;
-    }}"""
-        dynamic_locations.append(sse_location)
-        
-        # Create location block for StreamableHTTP transport
-        streamable_location = f"""
-    # --- MCP Protocol: StreamableHTTP Endpoint ---
-    location /api/streamable/{safe_path} {{
-        # First check auth via our MCP Gateway service
-        auth_request /api/tool_auth/{safe_path};
-        
-        # Then proxy to the streamable endpoint of the target service
-        proxy_pass {proxy_url.rstrip('/')}/streamable;
-        proxy_http_version 1.1;
-        
-        # Required settings for StreamableHTTP
-        proxy_buffering off;
-        
-        # Important timing settings for long-lived connections
-        proxy_read_timeout 600s;
-        proxy_connect_timeout 10s;
-        proxy_send_timeout 10s;
-        
-        # Standard proxy headers
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # Handle content negotiation
-        proxy_set_header Accept "application/json, text/event-stream";
-        
-        # Pass through authentication headers for service-specific tokens
-        proxy_pass_request_headers on;
-        proxy_set_header X-Service-Auth-Github $http_x_service_auth_github;
-        proxy_set_header X-Service-Auth-AWS $http_x_service_auth_aws;
-        proxy_set_header X-Service-Auth-Token $http_x_service_auth_token;
-        
-        # Handle auth errors
-        error_page 401 403 = @error401;
-        error_page 404 = @error404;
-        error_page 500 502 503 504 = @error5xx;
-    }}"""
-        dynamic_locations.append(streamable_location)
+        # No nginx proxy configuration needed for tool execution
 
     # Add the end marker
     dynamic_locations.append(end_marker)
@@ -2269,7 +2192,7 @@ async def get_server_details(
     return server_info
 
 
-# --- API endpoint for Tool Execution --- START
+# --- API endpoint for Tool Execution via SSE Transport --- START
 @app.post("/api/execute/{service_path:path}", response_model=None)
 async def execute_tool(
     request: Request,
@@ -2277,20 +2200,20 @@ async def execute_tool(
     username: Annotated[str, Depends(api_auth)],
 ):
     """
-    Execute a tool on a specific service through proper nginx proxy redirection.
+    Execute a tool on a specific service using MCP client with SSE transport.
     
-    This endpoint performs initial authorization checks and validation, then logs the attempt.
-    The actual execution is handled by nginx, which proxies the request to the appropriate
-    MCP server endpoint (typically /sse) after performing an auth_request check.
+    endpoint acts as an MCP client to backend servers, providing OAuth-protected
+    access to tools while maintaining proper MCP protocol compliance.
     
     Transport: Server-Sent Events (SSE)
     Auth required: mcp:server:{service_path}:execute scope or mcp:registry:admin scope
     
     Flow:
-    1. Authenticate and authorize the request using MCP SDK auth mechanisms
+    1. Authenticate and authorize the request 
     2. Validate service exists and is enabled
-    3. Log the tool execution attempt
-    4. Return 200 OK - nginx will handle the actual proxying to the MCP server
+    3. Establish MCP client session with backend server
+    4. Execute tool via proper MCP protocol
+    5. Return JSON-RPC compliant response
     """
     try:
         # Normalize the service path
@@ -2315,7 +2238,7 @@ async def execute_tool(
             logger.warning(f"Service disabled for tool execution: '{service_path}'")
             raise HTTPException(status_code=403, detail=f"Service '{service_path}' is disabled")
         
-        # Get service info
+        # Get service info and determine port
         service_info = REGISTERED_SERVERS.get(service_path)
         proxy_url = service_info.get("proxy_pass_url")
         
@@ -2335,35 +2258,101 @@ async def execute_tool(
                 detail=f"Missing required scope for service access: {execute_scope}",
             )
         
-        # Read the request body and log the attempt
+        # Parse JSON-RPC request
         try:
             body = await request.json()
-            tool_name = body.get("name")
-            input_params = body.get("input", {}).get("params", {})
-            logger.info(f"Tool execution: '{tool_name}' on '{service_path}' by '{username}' with params: {input_params}")
-        except:
-            # If we can't parse the body, just log a basic message
-            logger.info(f"Tool execution on '{service_path}' by '{username}' - could not parse request body")
-            body = {}
+            if not all(key in body for key in ["jsonrpc", "method", "params", "id"]):
+                raise ValueError("Invalid JSON-RPC format")
+            
+            tool_name = body["params"]["name"]
+            tool_arguments = body["params"]["arguments"]
+            request_id = body["id"]
+            
+            logger.info(f"Tool execution: '{tool_name}' on '{service_path}' by '{username}' with args: {tool_arguments}")
+        except Exception as e:
+            logger.error(f"Failed to parse JSON-RPC request: {e}")
+            raise HTTPException(status_code=400, detail="Invalid JSON-RPC request format")
         
-        # Process transport type from request headers
-        accept_header = request.headers.get("Accept", "")
-        if "text/event-stream" in accept_header:
-            logger.debug(f"Client requested SSE transport for '{service_path}'")
-        elif "application/json" in accept_header:
-            logger.debug(f"Client requested JSON transport for '{service_path}'")
+        # Establish MCP client session and execute tool
+        # Route through nginx to handle mount_path properly
+        # Nginx strips the service path prefix when proxying to backend
+        nginx_base = f"http://localhost{service_path}"  # e.g., http://localhost/currenttime
         
-        # Return success - nginx will handle the actual proxying based on configuration
-        return JSONResponse(
-            content=body,
-            status_code=200,
-            headers={
-                # Ensure caching is disabled for tool execution
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0"
-            }
-        )
+        # Try SSE endpoint through nginx
+        sse_endpoints = [
+            f"{nginx_base}/sse",  # e.g., http://localhost/currenttime/sse -> proxied to backend
+        ]
+        
+        last_error = None
+        for sse_url in sse_endpoints:
+            try:
+                logger.info(f"Attempting SSE connection to: {sse_url}")
+                # Connect to MCP server with timeout
+                async with sse_client(sse_url, timeout=10.0) as (read_stream, write_stream):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        # Initialize the session
+                        await asyncio.wait_for(session.initialize(), timeout=5.0)
+                        
+                        # Execute the tool
+                        result = await asyncio.wait_for(
+                            session.call_tool(tool_name, tool_arguments),
+                            timeout=30.0
+                        )
+                    
+                    # Extract content from MCP result and ensure it's serializable
+                    if hasattr(result, 'content'):
+                        if hasattr(result.content, 'text'):
+                            # Handle TextContent objects
+                            result_content = result.content.text
+                        elif isinstance(result.content, list):
+                            # Handle list of content objects
+                            result_content = []
+                            for item in result.content:
+                                if hasattr(item, 'text'):
+                                    result_content.append(item.text)
+                                else:
+                                    result_content.append(str(item))
+                        else:
+                            result_content = str(result.content)
+                    else:
+                        result_content = str(result)
+                    
+                    # Return JSON-RPC response
+                    # Ensure result is always an array for consistency
+                    if isinstance(result_content, list):
+                        result_array = result_content
+                    else:
+                        result_array = [result_content] if result_content else []
+                    
+                    return JSONResponse(
+                        content={
+                            "jsonrpc": "2.0",
+                            "result": result_array,
+                            "id": request_id
+                        },
+                        headers={
+                            "Cache-Control": "no-cache, no-store, must-revalidate",
+                            "Pragma": "no-cache",
+                            "Expires": "0"
+                        }
+                    )
+                        
+            except asyncio.TimeoutError as e:
+                logger.warning(f"Timeout connecting to MCP server at {sse_url}")
+                last_error = e
+                continue  # Try next endpoint
+            except Exception as e:
+                logger.warning(f"Error connecting to {sse_url}: {e}")
+                last_error = e
+                continue  # Try next endpoint
+        
+        # If we've tried all endpoints and none worked, raise the last error
+        if last_error:
+            if isinstance(last_error, asyncio.TimeoutError):
+                raise HTTPException(status_code=504, detail=f"Timeout connecting to service '{service_path}'")
+            else:
+                raise HTTPException(status_code=502, detail=f"Failed to execute tool on service '{service_path}': {str(last_error)}")
+            
     except Exception as e:
         # Log the error with appropriate level and context
         if isinstance(e, HTTPException):
@@ -2385,11 +2374,10 @@ async def execute_tool_streamable(
     username: Annotated[str, Depends(api_auth)],
 ):
     """
-    Execute a tool on a specific service using the StreamableHTTP transport.
+    Execute a tool on a specific service using MCP client with StreamableHTTP transport.
     
-    This endpoint performs initial authorization checks and validation, then logs the attempt.
-    The actual execution is handled by nginx, which proxies the request to the appropriate
-    MCP server endpoint (typically /streamable) after performing an auth_request check.
+    This endpoint acts as an MCP client to backend servers, providing OAuth-protected
+    access to tools while maintaining proper MCP protocol compliance.
     
     Transport: StreamableHTTP
     Auth required: mcp:server:{service_path}:execute scope or mcp:registry:admin scope
@@ -2419,7 +2407,7 @@ async def execute_tool_streamable(
             logger.warning(f"Service disabled for tool execution (streamable): '{service_path}'")
             raise HTTPException(status_code=403, detail=f"Service '{service_path}' is disabled")
         
-        # Get service info
+        # Get service info and determine port
         service_info = REGISTERED_SERVERS.get(service_path)
         proxy_url = service_info.get("proxy_pass_url")
         
@@ -2439,32 +2427,204 @@ async def execute_tool_streamable(
                 detail=f"Missing required scope for service access: {execute_scope}",
             )
         
-        # Read the request body and log the attempt
+        # Parse JSON-RPC request
         try:
             body = await request.json()
-            tool_name = body.get("name")
-            input_params = body.get("input", {}).get("params", {})
-            logger.info(f"StreamableHTTP tool execution: '{tool_name}' on '{service_path}' by '{username}' with params: {input_params}")
-        except:
-            # If we can't parse the body, just log a basic message
-            logger.info(f"StreamableHTTP tool execution on '{service_path}' by '{username}' - could not parse request body")
-            body = {}
+            if not all(key in body for key in ["jsonrpc", "method", "params", "id"]):
+                raise ValueError("Invalid JSON-RPC format")
+            
+            tool_name = body["params"]["name"]
+            tool_arguments = body["params"]["arguments"]
+            request_id = body["id"]
+            
+            logger.info(f"StreamableHTTP tool execution: '{tool_name}' on '{service_path}' by '{username}' with args: {tool_arguments}")
+        except Exception as e:
+            logger.error(f"Failed to parse JSON-RPC request: {e}")
+            raise HTTPException(status_code=400, detail="Invalid JSON-RPC request format")
         
-        # Process transport type from request headers
-        accept_header = request.headers.get("Accept", "")
-        logger.debug(f"StreamableHTTP client accept header: {accept_header}")
+        # Import MCP client with proper error handling
+        try:
+            from mcp import ClientSession
+            import httpx
+        except ImportError as e:
+            logger.error(f"MCP SDK not available: {e}")
+            raise HTTPException(status_code=500, detail="MCP SDK not properly installed")
         
-        # Return success - nginx will handle the actual proxying based on configuration
-        return JSONResponse(
-            content=body,
-            status_code=200,
-            headers={
-                # Ensure caching is disabled for tool execution
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0"
-            }
-        )
+        # Check if this server supports StreamableHTTP transport
+        # Route through nginx to handle mount_path properly
+        nginx_base = f"http://localhost{service_path}"  # e.g., http://localhost/currenttime
+        
+        # Try the MCP endpoint through nginx
+        mcp_endpoints = [
+            f"{nginx_base}/mcp",  # e.g., http://localhost/currenttime/mcp -> proxied to backend
+        ]
+        
+        streamable_url = None
+        for test_url in mcp_endpoints:
+            try:
+                # Test if StreamableHTTP endpoint exists
+                async with httpx.AsyncClient(timeout=5.0) as test_client:
+                    test_response = await test_client.get(test_url)
+                    if test_response.status_code != 404:
+                        streamable_url = test_url
+                        logger.info(f"Found StreamableHTTP endpoint at: {streamable_url}")
+                        break
+            except Exception as e:
+                logger.debug(f"Failed to test {test_url}: {e}")
+                continue
+        
+        try:
+            if streamable_url is None:
+                # Server doesn't support StreamableHTTP, fall back to SSE approach
+                logger.info(f"Server '{service_path}' doesn't support StreamableHTTP, using SSE approach")
+                
+                # Use SSE transport for this request
+                # Route through nginx to handle mount_path properly
+                nginx_base = f"http://localhost{service_path}"  # e.g., http://localhost/currenttime
+                
+                # Try SSE endpoint through nginx
+                sse_endpoints = [
+                    f"{nginx_base}/sse",  # e.g., http://localhost/currenttime/sse -> proxied to backend
+                ]
+                
+                last_error = None
+                for sse_url in sse_endpoints:
+                    try:
+                        logger.info(f"StreamableHTTP fallback - attempting SSE connection to: {sse_url}")
+                        # Connect to MCP server with timeout
+                        async with sse_client(sse_url, timeout=10.0) as (read_stream, write_stream):
+                            async with ClientSession(read_stream, write_stream) as session:
+                                # Initialize the session
+                                await asyncio.wait_for(session.initialize(), timeout=5.0)
+                                
+                                # Execute the tool
+                                result = await asyncio.wait_for(
+                                    session.call_tool(tool_name, tool_arguments),
+                                    timeout=30.0
+                                )
+                                
+                                # Extract content from MCP result and ensure it's serializable
+                                if hasattr(result, 'content'):
+                                    if hasattr(result.content, 'text'):
+                                        # Handle TextContent objects
+                                        result_content = result.content.text
+                                    elif isinstance(result.content, list):
+                                        # Handle list of content objects
+                                        result_content = []
+                                        for item in result.content:
+                                            if hasattr(item, 'text'):
+                                                result_content.append(item.text)
+                                            else:
+                                                result_content.append(str(item))
+                                    else:
+                                        result_content = str(result.content)
+                                else:
+                                    result_content = str(result)
+                                
+                                # Return JSON-RPC response
+                                # Ensure result is always an array for consistency
+                                if isinstance(result_content, list):
+                                    result_array = result_content
+                                else:
+                                    result_array = [result_content] if result_content else []
+                                
+                                return JSONResponse(
+                                    content={
+                                        "jsonrpc": "2.0",
+                                        "result": result_array,
+                                        "id": request_id
+                                    },
+                                    headers={
+                                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                                        "Pragma": "no-cache",
+                                        "Expires": "0"
+                                    }
+                                )
+                                    
+                    except asyncio.TimeoutError as e:
+                        logger.warning(f"StreamableHTTP fallback - timeout connecting to MCP server at {sse_url}")
+                        last_error = e
+                        continue  # Try next endpoint
+                    except Exception as e:
+                        logger.warning(f"StreamableHTTP fallback - error connecting to {sse_url}: {e}")
+                        last_error = e
+                        continue  # Try next endpoint
+                    
+                # If we've tried all endpoints and none worked, raise the last error
+                if last_error:
+                    if isinstance(last_error, asyncio.TimeoutError):
+                        raise HTTPException(status_code=504, detail=f"Timeout connecting to service '{service_path}'")
+                    else:
+                        raise HTTPException(status_code=502, detail=f"Failed to execute tool on service '{service_path}': {str(last_error)}")
+                
+            # Server supports StreamableHTTP, proceed with original implementation
+            else:
+                # Use the discovered streamable URL
+                # Make direct HTTP request to StreamableHTTP endpoint
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(
+                        streamable_url,
+                        json={
+                        "jsonrpc": "2.0",
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {
+                                "name": "mcp-gateway",
+                                "version": "1.0.0"
+                            }
+                        },
+                        "id": 1
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream"
+                    }
+                    )
+                    
+                    if response.status_code != 200:
+                        raise Exception(f"Failed to initialize MCP session: {response.status_code}")
+                    
+                    # Now execute the tool
+                    tool_response = await client.post(
+                    streamable_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "tools/call",
+                        "params": {
+                            "name": tool_name,
+                            "arguments": tool_arguments
+                        },
+                        "id": request_id
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream"
+                    }
+                    )
+                    
+                    if tool_response.status_code != 200:
+                        raise Exception(f"Tool execution failed: {tool_response.status_code} - {tool_response.text}")
+                    
+                    # Return the tool response
+                    result = tool_response.json()
+                    return JSONResponse(
+                    content=result,
+                    headers={
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                        "Expires": "0"
+                    }
+                )
+                
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout connecting to MCP server at {streamable_url}")
+            raise HTTPException(status_code=504, detail=f"Timeout connecting to service '{service_path}'")
+        except Exception as e:
+            logger.error(f"Error executing tool via StreamableHTTP: {e}", exc_info=True)
+            raise HTTPException(status_code=502, detail=f"Failed to execute tool on service '{service_path}': {str(e)}")
+            
     except Exception as e:
         # Log the error with appropriate level and context
         if isinstance(e, HTTPException):
