@@ -125,48 +125,51 @@ if [ ! -z "$MCP_AUTH_CONFIG_JSON" ]; then
 fi
 
 # --- Python Environment Setup ---
-echo "Checking for Python virtual environment..."
-if [ ! -d "$VENV_DIR" ] || [ ! -f "$VENV_DIR/bin/activate" ]; then
-  echo "Setting up Python environment..."
-  
-  # Install uv if not already installed
-  if ! command -v uv &> /dev/null; then
-    echo "Installing uv package manager..."
-    pip install uv
-  fi
-  
-  # Create virtual environment
-  echo "Creating virtual environment..."
-  uv venv "$VENV_DIR" --python 3.12
-  
-  # Install dependencies
-  echo "Installing Python dependencies..."
-  source "$VENV_DIR/bin/activate"
-  uv pip install \
-    "fastapi>=0.115.12" \
-    "itsdangerous>=2.2.0" \
-    "jinja2>=3.1.6" \
-    "mcp>=1.6.0" \
-    "pydantic>=2.11.3" \
-    "httpx>=0.27.0" \
-    "python-dotenv>=1.1.0" \
-    "python-multipart>=0.0.20" \
-    "uvicorn[standard]>=0.34.2" \
-    "faiss-cpu>=1.7.4" \
-    "sentence-transformers>=2.2.2" \
-    "websockets>=15.0.1" \
-    "scikit-learn>=1.3.0" \
-    "torch>=1.6.0" \
-    "huggingface-hub[cli,hf_xet]>=0.31.1" \
-    "hf_xet>=0.1.0"
-  
-  # Install the package itself
-  uv pip install -e /app
-  
-  echo "Python environment setup complete."
-else
-  echo "Python virtual environment already exists, skipping setup."
+echo "Setting up Python environment..."
+
+# Install uv if not already installed
+if ! command -v uv &> /dev/null; then
+  echo "Installing uv package manager..."
+  pip install uv
 fi
+
+# Create virtual environment (recreate if it exists)
+echo "Creating virtual environment..."
+if [ -d "$VENV_DIR" ]; then
+  echo "Removing existing virtual environment..."
+  rm -rf "$VENV_DIR"
+fi
+uv venv "$VENV_DIR" --python 3.12
+
+# Install dependencies
+echo "Installing Python dependencies..."
+source "$VENV_DIR/bin/activate"
+uv pip install \
+  "fastapi>=0.115.12" \
+  "itsdangerous>=2.2.0" \
+  "jinja2>=3.1.6" \
+  "mcp>=1.6.0" \
+  "pydantic>=2.11.3" \
+  "httpx>=0.27.0" \
+  "python-dotenv>=1.1.0" \
+  "python-multipart>=0.0.20" \
+  "uvicorn[standard]>=0.34.2" \
+  "faiss-cpu>=1.7.4" \
+  "sentence-transformers>=2.2.2" \
+  "websockets>=15.0.1" \
+  "scikit-learn>=1.3.0" \
+  "torch>=1.6.0" \
+  "huggingface-hub[cli,hf_xet]>=0.31.1" \
+  "hf_xet>=0.1.0" \
+  "pyjwt[crypto]>=2.8.0" \
+  "pycognito>=2024.3.1" \
+  "boto3>=1.28.0" \
+  "requests>=2.32.3"
+
+# Install the package itself
+uv pip install -e /app
+
+echo "Python environment setup complete."
 
 # --- SSL Certificate Generation ---
 echo "Checking for SSL certificates..."
@@ -185,8 +188,25 @@ else
 fi
 
 # --- Nginx Configuration ---
-echo "Copying custom Nginx configuration..."
-cp "$NGINX_CONF_SRC" "$NGINX_CONF_DEST"
+echo "Setting up Nginx configuration..."
+
+# Check if GATEWAY_HOSTNAME is set and add it to server_name directives
+if [ ! -z "$GATEWAY_HOSTNAME" ]; then
+  echo "Adding $GATEWAY_HOSTNAME to server_name directives in Nginx configuration..."
+  # Create a temporary file
+  TEMP_NGINX_CONF=$(mktemp)
+  # Use sed to append the GATEWAY_HOSTNAME to both server_name lines
+  sed 's/\(server_name .*\);/\1 '"$GATEWAY_HOSTNAME"';/g' "$NGINX_CONF_SRC" > "$TEMP_NGINX_CONF"
+  # Use the modified file as the source
+  cp "$TEMP_NGINX_CONF" "$NGINX_CONF_DEST"
+  # Clean up the temporary file
+  rm "$TEMP_NGINX_CONF"
+  echo "Added $GATEWAY_HOSTNAME to server_name directives."
+else
+  echo "GATEWAY_HOSTNAME not set, using default Nginx configuration..."
+  cp "$NGINX_CONF_SRC" "$NGINX_CONF_DEST"
+fi
+
 echo "Nginx configuration copied to $NGINX_CONF_DEST."
 
 # --- Model Verification ---

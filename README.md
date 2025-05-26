@@ -182,12 +182,14 @@ The Gateway and the Registry are available as a Docker container. The package in
     export ADMIN_USER=admin
     export ADMIN_PASSWORD=your-admin-password
     export POLYGON_API_KEY=your-polygon-api-key
+    export GATEWAY_HOSTNAME=your-ec2-hostname
     # stop any previous instance
     docker stop mcp-gateway-container && docker rm mcp-gateway-container 
     docker run -p 80:80 -p 443:443 -p 7860:7860 \
     -e ADMIN_USER=$ADMIN_USER \
     -e ADMIN_PASSWORD=$ADMIN_PASSWORD \
     -e POLYGON_API_KEY=$POLYGON_API_KEY \
+    -e GATEWAY_HOSTNAME=$GATEWAY_HOSTNAME \
     -e SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))') \
     -v /var/log/mcp-gateway:/app/logs \
     -v /opt/mcp-gateway/servers:/app/registry/servers \
@@ -231,6 +233,19 @@ The Gateway and the Registry are available as a Docker container. The package in
 1. **View MCP server metadata:**
    Metadata about all MCP servers connected to the Registry is available in `/opt/mcp-gateway/servers` directory. The metadata includes information gathered from `ListTools` as well as information provided while registering the server.
 
+   ```{.python}
+   python agents\agent.py --mcp-registry-url http://localhost/mcpgw/sse --message "what is the current time in clarksburg, md"
+   ```
+
+   You can also run the full test suite and get a handy agent evaluation report. This test suite exercises the Registry functionality as well as tests the multiple built-in MCP servers provided by the Gateway.
+   ```{python}
+   python agents\test_suite.py
+   ```
+   The result of the tests suites are available in the `agents/test_results` folder. It contains an `accuracy.json`, a `summary.json`, a `logs` folder and a `raw_data` folder that contains the verbose output from the agent. The test suite uses an LLM as a judge to evaluate the results for accuracy and tool usage quality.
+
+1. **Test the Gateway and Registry with the sample Agent and test suite**
+   The repo includes a test agent that can connect to the Registry to discover tools and invoke them to do interesting tasks. This functionality can be invoked either standalone or as part of a test suite.
+
 #### Running the Gateway over HTTPS
 
 1. Enable access to TCP port 443 from the IP address of your MCP client (your laptop, or anywhere) in the inbound rules in the security group associated with your EC2 instance.
@@ -246,6 +261,7 @@ The Gateway and the Registry are available as a Docker container. The package in
       -e ADMIN_USER=$ADMIN_USER \
       -e ADMIN_PASSWORD=$ADMIN_PASSWORD \
       -e POLYGON_API_KEY=$POLYGON_API_KEY \
+      -e GATEWAY_HOSTNAME=$GATEWAY_HOSTNAME \
       -e SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))') \
       -v /path/to/certs:/etc/ssl/certs \
       -v /path/to/private:/etc/ssl/private \
