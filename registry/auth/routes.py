@@ -65,6 +65,17 @@ def setup_auth_routes(app, provider: ConfigurableIdPAdapter, settings: AuthSetti
         base_url = os.environ.get("MCP_AUTH_BASE_URL", "http://localhost:7860")
         issuer_url = AnyHttpUrl(base_url)
         
+        # Update callback URI to use the base_url
+        if settings.idp_settings.callback_uri and "localhost" in settings.idp_settings.callback_uri:
+            # Extract the path part from the callback URI
+            from urllib.parse import urlparse
+            parsed_uri = urlparse(settings.idp_settings.callback_uri)
+            path = parsed_uri.path
+            
+            # Create new callback URI with the base_url
+            settings.idp_settings.callback_uri = f"{base_url}{path}"
+            logger.info(f"Updated callback URI to: {settings.idp_settings.callback_uri}")
+        
         # Create standard OAuth routes
         sdk_routes = create_auth_routes(
             provider=provider,
@@ -135,16 +146,21 @@ async def oauth_login(request: Request, t: str = None):
     logger.info(f"Generated callback URI with cache busting: {callback_uri}")
     
     # Create OAuth client information
+    base_url = os.environ.get("MCP_AUTH_BASE_URL", "http://localhost:7860")
     client = OAuthClientInformationFull(
         client_id=client_id,
         client_secret=_settings.idp_settings.client_secret,
         redirect_uris=[callback_uri],
         client_metadata=OAuthClientMetadata(
             client_name="MCP Gateway",
-            client_uri=os.environ.get("MCP_AUTH_BASE_URL", "http://localhost:7860"),
+            client_uri=base_url,
             redirect_uris=[callback_uri]
         )
     )
+    
+    # Log the base URL and callback URI for debugging
+    logger.info(f"Using base URL: {base_url}")
+    logger.info(f"Using callback URI: {callback_uri}")
     
     # Create completely unique state with timestamp and random token
     # This makes each OAuth flow unique and prevents browser caching

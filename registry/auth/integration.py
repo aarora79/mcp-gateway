@@ -71,10 +71,16 @@ def _setup_cognito_from_env(app: FastAPI, templates: Jinja2Templates) -> Optiona
     client_secret = os.environ.get("MCP_AUTH_COGNITO_CLIENT_SECRET")
     callback_uri = os.environ.get("MCP_AUTH_COGNITO_CALLBACK_URI")
     region = os.environ.get("MCP_AUTH_COGNITO_REGION", "us-east-1")
+    custom_domain = os.environ.get("MCP_AUTH_COGNITO_CUSTOM_DOMAIN")
     
     if not all([user_pool_id, client_id, client_secret, callback_uri]):
         logger.warning("Missing required Cognito configuration")
         return None
+    
+    # Log the configuration for debugging
+    logger.info(f"Setting up Cognito with user_pool_id={user_pool_id}, region={region}")
+    if custom_domain:
+        logger.info(f"Using custom Cognito domain: {custom_domain}")
     
     # Create the Cognito provider with enhanced security
     provider = CognitoOAuthProvider.from_user_pool(
@@ -82,7 +88,8 @@ def _setup_cognito_from_env(app: FastAPI, templates: Jinja2Templates) -> Optiona
         client_id=client_id,
         client_secret=client_secret,
         callback_uri=callback_uri,
-        region=region
+        region=region,
+        custom_domain=custom_domain
     )
     
     # Set up middleware and routes

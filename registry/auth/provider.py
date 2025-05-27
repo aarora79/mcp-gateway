@@ -171,9 +171,21 @@ class ConfigurableIdPAdapter(OAuthAuthorizationServerProvider[MCP_AuthCode, Refr
                             idp_scopes.append(mapped_scope)
         
         # Build the authorization URL
+        # Use the environment variable for the base URL if available
+        callback_uri = self.idp_settings.callback_uri
+        base_url = os.environ.get("MCP_AUTH_BASE_URL")
+        
+        # If base_url is set and callback_uri contains localhost, update it
+        if base_url and "localhost" in callback_uri:
+            from urllib.parse import urlparse
+            parsed_uri = urlparse(callback_uri)
+            path = parsed_uri.path
+            callback_uri = f"{base_url}{path}"
+            logger.info(f"Updated callback URI for authorization: {callback_uri}")
+        
         auth_params = {
             "client_id": self.idp_settings.client_id,
-            "redirect_uri": self.idp_settings.callback_uri,
+            "redirect_uri": callback_uri,
             "response_type": "code",
             "state": state,
             "scope": " ".join(idp_scopes),
@@ -383,12 +395,24 @@ class ConfigurableIdPAdapter(OAuthAuthorizationServerProvider[MCP_AuthCode, Refr
     
     async def _exchange_code_with_idp(self, code: str, auth_code: MCP_AuthCode = None) -> dict:
         """Exchange authorization code with the IdP."""
+        # Use the environment variable for the base URL if available
+        callback_uri = self.idp_settings.callback_uri
+        base_url = os.environ.get("MCP_AUTH_BASE_URL")
+        
+        # If base_url is set and callback_uri contains localhost, update it
+        if base_url and "localhost" in callback_uri:
+            from urllib.parse import urlparse
+            parsed_uri = urlparse(callback_uri)
+            path = parsed_uri.path
+            callback_uri = f"{base_url}{path}"
+            logger.info(f"Updated callback URI for token exchange: {callback_uri}")
+            
         token_params = {
             "grant_type": "authorization_code",
             "client_id": self.idp_settings.client_id,
             "client_secret": self.idp_settings.client_secret,
             "code": code,
-            "redirect_uri": self.idp_settings.callback_uri
+            "redirect_uri": callback_uri
         }
         
         # Get the code verifier for PKCE
@@ -843,8 +867,9 @@ class CognitoOAuthProvider(ConfigurableIdPAdapter):
     """
     
     @classmethod
-    def from_user_pool(cls, user_pool_id: str, client_id: str, client_secret: str, 
-                       callback_uri: str, region: str = "us-east-1") -> "CognitoOAuthProvider":
+    def from_user_pool(cls, user_pool_id: str, client_id: str, client_secret: str,
+                       callback_uri: str, region: str = "us-east-1",
+                       custom_domain: str = None) -> "CognitoOAuthProvider":
         """
         Create a Cognito provider from user pool details.
         
@@ -854,6 +879,7 @@ class CognitoOAuthProvider(ConfigurableIdPAdapter):
             client_secret: The app client secret
             callback_uri: The callback URI for the OAuth flow
             region: AWS region, defaults to us-east-1
+            custom_domain: Optional custom domain for Cognito
             
         Returns:
             Configured CognitoOAuthProvider
@@ -861,18 +887,32 @@ class CognitoOAuthProvider(ConfigurableIdPAdapter):
         # Extract region from the user pool ID (format is region_poolID)
         region_from_id = user_pool_id.split('_')[0]
         pool_id = user_pool_id.split('_')[1]
-        domain_prefix = f"{region_from_id}-{pool_id.lower()}"
+        
+        # Log the parsed values for debugging
+        logger.info(f"Parsed user pool ID: region={region_from_id}, pool_id={pool_id}")
+        
+        # Try preserving the case of the pool ID
+        domain_prefix = f"{region_from_id}-{pool_id}"
+        logger.info(f"Using domain prefix with preserved case: {domain_prefix}")
         
         # Standard Cognito domain formats
         domain = f"cognito-idp.{region}.amazonaws.com/{user_pool_id}"
+        
+        # Determine the domain to use for authorization and token endpoints
+        if custom_domain:
+            auth_domain = custom_domain
+            logger.info(f"Using custom Cognito domain: {auth_domain}")
+        else:
+            auth_domain = domain
+            logger.info(f"Using default Cognito domain: {auth_domain}")
         
         # Build IdP settings for the provider
         idp_settings = IdPSettings(
             provider_type="cognito",
             client_id=client_id,
             client_secret=client_secret,
-            authorize_url=f"https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/authorize",
-            token_url=f"https://{domain_prefix}.auth.{region}.amazoncognito.com/oauth2/token",
+            authorize_url=f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}", #f"https://{auth_domain}/oauth2/authorize",
+            token_url=f"https://{auth_domain}/oauth2/token",
             jwks_url=f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json",
             callback_uri=callback_uri,
             audience=client_id,
