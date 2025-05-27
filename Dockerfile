@@ -28,7 +28,6 @@ COPY . /app/
 # Note: We copy it here so it's part of the image layer
 COPY docker/nginx_rev_proxy.conf /app/docker/nginx_rev_proxy.conf
 
-
 # Make the entrypoint script executable
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 RUN chmod +x /app/docker/entrypoint.sh
@@ -42,11 +41,16 @@ ARG SECRET_KEY=""
 ARG ADMIN_USER="admin"
 ARG ADMIN_PASSWORD=""
 ARG POLYGON_API_KEY=""
+ARG MCP_AUTH_ENABLED="false"
+ARG MCP_GATEWAY_DEV_MODE="true"
 
+# Pass build args to runtime environment
 ENV SECRET_KEY=$SECRET_KEY
 ENV ADMIN_USER=$ADMIN_USER
 ENV ADMIN_PASSWORD=$ADMIN_PASSWORD
 ENV POLYGON_API_KEY=$POLYGON_API_KEY
+ENV MCP_AUTH_ENABLED=$MCP_AUTH_ENABLED
+ENV MCP_GATEWAY_DEV_MODE=$MCP_GATEWAY_DEV_MODE
 
 # Run the entrypoint script when the container launches
 ENTRYPOINT ["/app/docker/entrypoint.sh"]

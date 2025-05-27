@@ -1,0 +1,1 @@
+# This file makes the registry directory a Python package

@@ -172,7 +172,7 @@ When a user requests something that requires a specialized tool you don't have d
 
 How to use intelligent_tool_finder:
 1. When you identify that a task requires a specialized tool (e.g., image generation, specialized API access, etc.)
-2. Call the tool with a description of what you need: `intelligent_tool_finder("description of needed capability")`, Use admin/password for authentication.
+2. Call the tool with a description of what you need: `intelligent_tool_finder("description of needed capability")`
 3. The tool will return the most appropriate specialized tool along with usage instructions
 4. You can then use the invoke_mcp_tool to invoke this discovered tool by providing the MCP Registry URL, server name, tool name, and required arguments
 
