@@ -891,9 +891,9 @@ class CognitoOAuthProvider(ConfigurableIdPAdapter):
         # Log the parsed values for debugging
         logger.info(f"Parsed user pool ID: region={region_from_id}, pool_id={pool_id}")
         
-        # Try preserving the case of the pool ID
+        # Cognito hosted UI domains
         domain_prefix = f"{region_from_id}-{pool_id}"
-        logger.info(f"Using domain prefix with preserved case: {domain_prefix}")
+        logger.info(f"Using domain prefix: {domain_prefix}")
         
         # Standard Cognito domain formats
         domain = f"cognito-idp.{region}.amazonaws.com/{user_pool_id}"
@@ -903,15 +903,16 @@ class CognitoOAuthProvider(ConfigurableIdPAdapter):
             auth_domain = custom_domain
             logger.info(f"Using custom Cognito domain: {auth_domain}")
         else:
-            auth_domain = domain
-            logger.info(f"Using default Cognito domain: {auth_domain}")
+            # Cognito OAuth uses the hosted UI domain, not the API domain
+            auth_domain = f"{domain_prefix}.auth.{region}.amazoncognito.com"
+            logger.info(f"Using Cognito hosted UI domain: {auth_domain}")
         
         # Build IdP settings for the provider
         idp_settings = IdPSettings(
             provider_type="cognito",
             client_id=client_id,
             client_secret=client_secret,
-            authorize_url=f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}", #f"https://{auth_domain}/oauth2/authorize",
+            authorize_url=f"https://{auth_domain}/oauth2/authorize",
             token_url=f"https://{auth_domain}/oauth2/token",
             jwks_url=f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json",
             callback_uri=callback_uri,
