@@ -19,6 +19,7 @@ from sentence_transformers import SentenceTransformer # Added
 import numpy as np # Added
 from sklearn.metrics.pairwise import cosine_similarity # Added
 import faiss # Added
+from datetime import datetime, timezone # Added for tracking timestamps
 
 # Configure logging
 logging.basicConfig(
@@ -39,6 +40,36 @@ if not REGISTRY_BASE_URL:
 # --- Global state for authentication ---
 _session_cookie: Optional[str] = None
 _auth_lock = asyncio.Lock()
+
+# --- Tool Recommendation Tracking --- START
+# Removed local tracking - now reports to registry instead
+
+async def report_recommendation_to_registry(service_path: str, tool_name: str, service_name: str, 
+                                          query: str = None, similarity_score: float = None, 
+                                          credentials: Credentials = None):
+    """Report a tool recommendation to the registry for centralized tracking."""
+    try:
+        endpoint = "/report_tool_recommendation"
+        
+        form_data = {
+            "server_name": service_name,
+            "tool_name": tool_name,
+            "service_path": service_path,
+            "recommendation_timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        if query:
+            form_data["query"] = query
+        if similarity_score is not None:
+            form_data["similarity_score"] = similarity_score
+        
+        await _call_registry_api("POST", endpoint, credentials=credentials, data=form_data)
+        logger.debug(f"MCPGW: Reported recommendation to registry: {service_path}/{tool_name}")
+        
+    except Exception as e:
+        # Don't let tracking failures break the main functionality
+        logger.error(f"MCPGW: Failed to report recommendation to registry for {service_path}/{tool_name}: {e}")
+# --- Tool Recommendation Tracking --- END
 
 # --- FAISS and Sentence Transformer Integration for mcpgw --- START
 _faiss_data_lock = asyncio.Lock()
@@ -774,11 +805,160 @@ async def intelligent_tool_finder(
     final_results = ranked_tools[:top_n_tools]
     logger.info(f"MCPGW: Top {len(final_results)} tools found: {json.dumps(final_results, indent=2)}")
     
+    # --- Track recommendations for analytics --- START
+    for result in final_results:
+        try:
+            await report_recommendation_to_registry(result["service_path"], result["tool_name"], result["service_name"], 
+                                                    natural_language_query, result["overall_similarity_score"], auth_credentials)
+        except Exception as e:
+            logger.error(f"MCPGW: Failed to track recommendation for {result['service_path']}/{result['tool_name']}: {e}")
+    # --- Track recommendations for analytics --- END
+    
     # Remove the temporary 'text_for_embedding' field from results
     for res in final_results:
         del res["text_for_embedding"]
         
     return final_results
+
+
+@mcp.tool()
+async def report_tool_metrics(
+    server_name: str = Field(..., description="Name of the server that provided the tool."),
+    tool_name: str = Field(..., description="Name of the tool that was executed."),
+    tool_execution_result: str = Field(..., description="Result of tool execution: 'success' or 'failure'."),
+    tool_execution_feedback: Optional[str] = Field(None, description="Optional feedback about the tool execution from the LLM."),
+    username: str = Field(..., description="Username for registry authentication"),
+    password: str = Field(..., description="Password for registry authentication")
+) -> Dict[str, Any]:
+    """
+    Reports tool usage metrics back to the registry for analytics and improvement.
+    
+    This function sends tool execution data to the main registry's /report_tool_metrics endpoint,
+    allowing the registry to track tool usage patterns, success rates, and collect feedback
+    for improving the MCP ecosystem.
+    
+    Args:
+        server_name: Name of the server that provided the tool.
+        tool_name: Name of the tool that was executed.
+        tool_execution_result: Result of tool execution ('success' or 'failure').
+        tool_execution_feedback: Optional feedback about the tool execution.
+        username: Username for registry authentication.
+        password: Password for registry authentication.
+        
+    Returns:
+        Dict[str, Any]: Response from the registry API confirming the metrics were recorded.
+        
+    Raises:
+        Exception: If the API call fails or validation errors occur.
+    """
+    # Validate tool_execution_result
+    if tool_execution_result not in ["success", "failure"]:
+        raise ValueError("tool_execution_result must be either 'success' or 'failure'")
+    
+    endpoint = "/report_tool_metrics"
+    credentials = Credentials(username=username, password=password)
+    
+    # Create form data for the metrics
+    form_data = {
+        "server_name": server_name,
+        "tool_name": tool_name,
+        "tool_execution_result": tool_execution_result,
+        "execution_timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    
+    # Add feedback if provided
+    if tool_execution_feedback:
+        form_data["tool_execution_feedback"] = tool_execution_feedback
+    
+    logger.info(f"MCPGW: Reporting tool metrics for {server_name}/{tool_name} with result: {tool_execution_result}")
+    
+    try:
+        response = await _call_registry_api("POST", endpoint, credentials=credentials, data=form_data)
+        logger.info(f"MCPGW: Successfully reported tool metrics for {server_name}/{tool_name}")
+        return response
+    except Exception as e:
+        logger.error(f"MCPGW: Failed to report tool metrics for {server_name}/{tool_name}: {e}")
+        raise Exception(f"Failed to report tool metrics: {str(e)}") from e
+
+
+@mcp.tool()
+async def get_recommendation_stats(
+    username: str = Field(..., description="Username for registry authentication"),
+    password: str = Field(..., description="Password for registry authentication")
+) -> Dict[str, Any]:
+    """
+    Retrieves current tool recommendation statistics from the registry.
+    
+    This shows how many times each tool has been recommended by the intelligent_tool_finder,
+    along with timestamps and summary statistics.
+    
+    Args:
+        username: Username for registry authentication.
+        password: Password for registry authentication.
+    
+    Returns:
+        Dict[str, Any]: Comprehensive recommendation statistics including:
+            - total_recommendations: Total number of tool recommendations made
+            - total_tools_recommended: Number of unique tools that have been recommended
+            - services_count: Number of services with recommended tools
+            - detailed_stats: Per-service and per-tool recommendation counts and timestamps
+    """
+    credentials = Credentials(username=username, password=password)
+    
+    try:
+        # Fetch recommendation data from registry
+        endpoint = "/api/tool_metrics?event_type=recommendation&limit=10000"
+        response = await _call_registry_api("GET", endpoint, credentials=credentials)
+        
+        recommendation_metrics = response.get("metrics", [])
+        summary = response.get("summary", {})
+        
+        # Process the data to match the expected format
+        detailed_stats = {}
+        for metric in recommendation_metrics:
+            service_path = metric.get("service_path")
+            tool_name = metric.get("tool_name")
+            
+            if service_path and tool_name:
+                if service_path not in detailed_stats:
+                    detailed_stats[service_path] = {}
+                
+                if tool_name not in detailed_stats[service_path]:
+                    detailed_stats[service_path][tool_name] = {
+                        "count": 0,
+                        "last_recommended": None
+                    }
+                
+                detailed_stats[service_path][tool_name]["count"] += 1
+                
+                # Update last recommended timestamp if this one is more recent
+                recommendation_time = metric.get("recommendation_timestamp")
+                if recommendation_time:
+                    current_last = detailed_stats[service_path][tool_name]["last_recommended"]
+                    if not current_last or recommendation_time > current_last:
+                        detailed_stats[service_path][tool_name]["last_recommended"] = recommendation_time
+        
+        result = {
+            "total_recommendations": summary.get("recommendation_count", 0),
+            "total_tools_recommended": len([tool for service in detailed_stats.values() for tool in service.keys()]),
+            "services_count": len(detailed_stats),
+            "detailed_stats": detailed_stats
+        }
+        
+        logger.info(f"MCPGW: Retrieved recommendation stats from registry: {result['total_recommendations']} total recommendations across {result['total_tools_recommended']} tools")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"MCPGW: Failed to retrieve recommendation stats from registry: {e}")
+        # Return empty stats on error
+        return {
+            "total_recommendations": 0,
+            "total_tools_recommended": 0,
+            "services_count": 0,
+            "detailed_stats": {},
+            "error": f"Failed to retrieve stats: {str(e)}"
+        }
 
 
 # --- Main Execution ---
