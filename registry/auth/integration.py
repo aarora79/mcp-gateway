@@ -92,6 +92,11 @@ def _setup_cognito_from_env(app: FastAPI, templates: Jinja2Templates) -> Optiona
         custom_domain=custom_domain
     )
     
+    # Ensure we don't set audience for Cognito
+    if hasattr(provider.settings.idp_settings, 'audience'):
+        provider.settings.idp_settings.audience = None
+        logger.info("Removed audience parameter for Cognito OAuth flow")
+    
     # Set up middleware and routes
     setup_auth_middleware(app, provider, provider.settings)
     setup_auth_routes(app, provider, provider.settings, templates)

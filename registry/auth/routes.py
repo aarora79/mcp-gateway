@@ -136,6 +136,15 @@ async def oauth_login(request: Request, t: str = None):
     client_id = _settings.idp_settings.client_id
     callback_uri = _settings.idp_settings.callback_uri
     
+    # Create OAuth client information
+    base_url = os.environ.get("MCP_AUTH_BASE_URL", "http://localhost:7860")
+    logger.info(f"Using base URL: {base_url}")
+    
+    # Ensure callback_uri is a fully qualified URL
+    if not callback_uri.startswith('http'):
+        callback_uri = f"{base_url}{callback_uri if callback_uri.startswith('/') else '/' + callback_uri}"
+        logger.info(f"Converted callback URI to absolute URL: {callback_uri}")
+    
     # Generate a completely unique callback URI with current timestamp
     # This ensures the browser cannot reuse a cached redirect
     if "?" not in callback_uri:
@@ -144,9 +153,14 @@ async def oauth_login(request: Request, t: str = None):
         callback_uri = f"{callback_uri}&t={timestamp}&r={secrets.token_hex(8)}"
     
     logger.info(f"Generated callback URI with cache busting: {callback_uri}")
+    # Ensure we have a valid absolute URL for OAuthClientMetadata
+    if not callback_uri.startswith('http'):
+        logger.error(f"Callback URI is not an absolute URL: {callback_uri}")
+        raise AuthorizeError(
+            error="server_error",
+            error_description="Invalid callback URI format - must be absolute URL"
+        )
     
-    # Create OAuth client information
-    base_url = os.environ.get("MCP_AUTH_BASE_URL", "http://localhost:7860")
     client = OAuthClientInformationFull(
         client_id=client_id,
         client_secret=_settings.idp_settings.client_secret,
@@ -195,10 +209,24 @@ async def oauth_login(request: Request, t: str = None):
 @router.get("/oauth/callback")
 async def oauth_callback(request: Request, code: str = None, state: str = None):
     """Handle the callback from the IdP."""
-    logger.info(f"OAuth callback received with code={code is not None}, state={state[:10] if state else None}")
+    logger.error(f"OAuth callback received with code={code is not None}, state={state[:10] if state else None}")
+    logger.error(f"Full request URL: {request.url}")
+    logger.error(f"Request query params: {request.query_params}")
+    
+    # Check for error parameters in the callback
+    error = request.query_params.get("error")
+    error_description = request.query_params.get("error_description")
+    
+    if error:
+        logger.error(f"Error in OAuth callback parameters: {error} - {error_description}")
+        raise AuthorizeError(
+            error=error,
+            error_description=error_description or "Error in OAuth callback"
+        )
     
     if not code or not state:
         # Use StandardError format from SDK
+        logger.error(f"Missing code or state parameter. code={code is not None}, state={state is not None}")
         raise AuthorizeError(
             error="invalid_request",
             error_description="Missing code or state parameter"
@@ -431,6 +459,25 @@ async def provider_callback(request: Request, provider: str, code: str = None, s
     
     try:
         # Forward to the main callback handler
+        logger.error(f"Provider callback - Request query params: {request.query_params}")
+        logger.error(f"Provider callback - Request headers: {request.headers}")
+        
+        # Check for error parameters in the callback
+        error = request.query_params.get("error")
+        error_description = request.query_params.get("error_description")
+        if error:
+            logger.error(f"Error in OAuth callback: {error} - {error_description}")
+            
+            # Provide more specific guidance based on the error
+            user_message = error_description
+            if error == "invalid_request" and "invalid_scope" in error_description:
+                user_message = "Invalid scope error. Please check that the scopes configured in Cognito match the requested scopes (openid, profile, email)."
+                
+            return RedirectResponse(
+                url=f"/login?error={error}&error_description={user_message}",
+                status_code=status.HTTP_303_SEE_OTHER
+            )
+            
         response = await oauth_callback(request, code, state)
         # Log the response details to debug cookie issues
         logger.info(f"Callback completed. Response status: {response.status_code}, Headers: {response.headers}")

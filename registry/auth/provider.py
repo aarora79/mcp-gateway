@@ -175,13 +175,17 @@ class ConfigurableIdPAdapter(OAuthAuthorizationServerProvider[MCP_AuthCode, Refr
         callback_uri = self.idp_settings.callback_uri
         base_url = os.environ.get("MCP_AUTH_BASE_URL")
         
-        # If base_url is set and callback_uri contains localhost, update it
-        if base_url and "localhost" in callback_uri:
-            from urllib.parse import urlparse
-            parsed_uri = urlparse(callback_uri)
-            path = parsed_uri.path
-            callback_uri = f"{base_url}{path}"
-            logger.info(f"Updated callback URI for authorization: {callback_uri}")
+        # Ensure callback_uri is a fully qualified URL
+        if base_url:
+            # If callback_uri is relative or contains localhost, update it with base_url
+            if not callback_uri.startswith('http') or "localhost" in callback_uri:
+                from urllib.parse import urlparse
+                parsed_uri = urlparse(callback_uri) if callback_uri.startswith('http') else None
+                path = parsed_uri.path if parsed_uri else callback_uri
+                if not path.startswith('/'):
+                    path = '/' + path
+                callback_uri = f"{base_url}{path}"
+                logger.info(f"Updated callback URI for authorization: {callback_uri}")
         
         auth_params = {
             "client_id": self.idp_settings.client_id,
@@ -193,8 +197,10 @@ class ConfigurableIdPAdapter(OAuthAuthorizationServerProvider[MCP_AuthCode, Refr
             "code_challenge_method": "S256"
         }
         
-        if self.idp_settings.audience:
+        # Only add audience if it's explicitly set and not None
+        if self.idp_settings.audience is not None:
             auth_params["audience"] = self.idp_settings.audience
+            logger.info(f"Adding audience parameter: {self.idp_settings.audience}")
             
         url = f"{self.idp_settings.authorize_url}?{urllib.parse.urlencode(auth_params)}"
         return url
@@ -399,13 +405,17 @@ class ConfigurableIdPAdapter(OAuthAuthorizationServerProvider[MCP_AuthCode, Refr
         callback_uri = self.idp_settings.callback_uri
         base_url = os.environ.get("MCP_AUTH_BASE_URL")
         
-        # If base_url is set and callback_uri contains localhost, update it
-        if base_url and "localhost" in callback_uri:
-            from urllib.parse import urlparse
-            parsed_uri = urlparse(callback_uri)
-            path = parsed_uri.path
-            callback_uri = f"{base_url}{path}"
-            logger.info(f"Updated callback URI for token exchange: {callback_uri}")
+        # Ensure callback_uri is a fully qualified URL
+        if base_url:
+            # If callback_uri is relative or contains localhost, update it with base_url
+            if not callback_uri.startswith('http') or "localhost" in callback_uri:
+                from urllib.parse import urlparse
+                parsed_uri = urlparse(callback_uri) if callback_uri.startswith('http') else None
+                path = parsed_uri.path if parsed_uri else callback_uri
+                if not path.startswith('/'):
+                    path = '/' + path
+                callback_uri = f"{base_url}{path}"
+                logger.info(f"Updated callback URI for token exchange: {callback_uri}")
             
         token_params = {
             "grant_type": "authorization_code",
@@ -892,7 +902,7 @@ class CognitoOAuthProvider(ConfigurableIdPAdapter):
         logger.info(f"Parsed user pool ID: region={region_from_id}, pool_id={pool_id}")
         
         # Cognito hosted UI domains
-        domain_prefix = f"{region_from_id}-{pool_id}"
+        domain_prefix = f"{region_from_id}{pool_id}"
         logger.info(f"Using domain prefix: {domain_prefix}")
         
         # Standard Cognito domain formats
@@ -916,7 +926,7 @@ class CognitoOAuthProvider(ConfigurableIdPAdapter):
             token_url=f"https://{auth_domain}/oauth2/token",
             jwks_url=f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json",
             callback_uri=callback_uri,
-            audience=client_id,
+            audience=None,  # Setting audience to None for Cognito to avoid scope issues
             issuer=f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}",
             scopes=["openid", "email", "profile"]  # Default scopes for Cognito
         )

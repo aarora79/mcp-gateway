@@ -183,3 +183,4 @@ registry/server_state.json
 registry/nginx_mcp_revproxy.conf
 logs/
 agents/test_results/
+.env.docker
