@@ -3,6 +3,9 @@ import json
 import secrets
 import asyncio
 import subprocess
+import httpx
+import logging
+from urllib.parse import urlparse
 # argparse removed as we're using environment variables instead
 from contextlib import asynccontextmanager
 from pathlib import Path  # Import Path
@@ -12,6 +15,7 @@ from datetime import datetime, timezone
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from registry.oauth_service import oauth_manager, OAuthConfig, OAuthDiscovery
 
 # Get configuration from environment variables
 EMBEDDINGS_MODEL_NAME = os.environ.get('EMBEDDINGS_MODEL_NAME', 'all-MiniLM-L6-v2')
@@ -33,7 +37,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 from dotenv import load_dotenv
-import logging
 
 # --- MCP Client Imports --- START
 from mcp import ClientSession
@@ -370,6 +373,29 @@ LOCATION_BLOCK_TEMPLATE = """
     }}
 """
 
+HTTPS_LOCATION_BLOCK_TEMPLATE = """
+    location {path}/ {{
+        proxy_pass {proxy_pass_url}/;
+        proxy_http_version 1.1;
+        
+        # HTTPS upstream SSL configuration
+        proxy_ssl_verify on;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_protocols TLSv1.2 TLSv1.3;
+        proxy_ssl_server_name on;
+        proxy_ssl_name {upstream_host};
+        
+        # Proxy headers - use actual upstream hostname for Host
+        proxy_set_header Host {upstream_host};
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # OAuth token forwarding (if available)
+        {auth_headers}
+    }}
+"""
+
 COMMENTED_LOCATION_BLOCK_TEMPLATE = """
 #    location {path}/ {{
 #        proxy_pass {proxy_pass_url};
@@ -380,6 +406,57 @@ COMMENTED_LOCATION_BLOCK_TEMPLATE = """
 #        proxy_set_header X-Forwarded-Proto $scheme;
 #    }}
 """
+
+COMMENTED_HTTPS_LOCATION_BLOCK_TEMPLATE = """
+#    location {path}/ {{
+#        proxy_pass {proxy_pass_url}/;
+#        proxy_http_version 1.1;
+#        
+#        # HTTPS upstream SSL configuration
+#        proxy_ssl_verify on;
+#        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+#        proxy_ssl_protocols TLSv1.2 TLSv1.3;
+#        proxy_ssl_server_name on;
+#        proxy_ssl_name {upstream_host};
+#        
+#        # Proxy headers - use actual upstream hostname for Host
+#        proxy_set_header Host {upstream_host};
+#        proxy_set_header X-Real-IP $remote_addr;
+#        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#        proxy_set_header X-Forwarded-Proto $scheme;
+#        
+#        # OAuth token forwarding (if available)
+#        {auth_headers}
+#    }}
+"""
+
+def extract_upstream_host(proxy_url: str) -> str:
+    """Extract the hostname from a proxy URL for SNI configuration."""
+    parsed = urlparse(proxy_url)
+    return parsed.hostname or "localhost"
+
+def generate_auth_headers_for_nginx(server_path: str) -> str:
+    """Generate nginx proxy_set_header directives for OAuth authentication."""
+    if not oauth_manager.has_oauth_config(server_path):
+        return "# No OAuth configuration"
+    
+    try:
+        # Get auth headers from OAuth manager
+        auth_headers = oauth_manager.get_auth_headers(server_path)
+        if not auth_headers:
+            return "# OAuth configured but no valid token"
+        
+        # Convert to nginx proxy_set_header directives
+        nginx_headers = []
+        for header_name, header_value in auth_headers.items():
+            # Escape any special characters in the header value
+            escaped_value = header_value.replace('"', '\\"')
+            nginx_headers.append(f'        proxy_set_header {header_name} "{escaped_value}";')
+        
+        return "\n".join(nginx_headers)
+    except Exception as e:
+        logger.warning(f"Failed to generate auth headers for {server_path}: {e}")
+        return "# OAuth configured but error generating headers"
 
 def regenerate_nginx_config():
     """Generates the nginx config file based on registered servers and their state."""
@@ -408,10 +485,33 @@ def regenerate_nginx_config():
                 logger.warning(f"Skipping server '{server_info['server_name']}' ({path}) - missing proxy_pass_url.")
                 continue
 
+            # Determine if this is an HTTPS upstream
+            is_https = proxy_url.startswith("https://")
+            upstream_host = extract_upstream_host(proxy_url) if is_https else ""
+            auth_headers = generate_auth_headers_for_nginx(path) if is_https else ""
+
+            # Choose the appropriate template based on status and protocol
             if is_enabled and health_status == "healthy":
-                block = LOCATION_BLOCK_TEMPLATE.format(path=path, proxy_pass_url=proxy_url)
+                if is_https:
+                    block = HTTPS_LOCATION_BLOCK_TEMPLATE.format(
+                        path=path, 
+                        proxy_pass_url=proxy_url,
+                        upstream_host=upstream_host,
+                        auth_headers=auth_headers
+                    )
+                else:
+                    block = LOCATION_BLOCK_TEMPLATE.format(path=path, proxy_pass_url=proxy_url)
             else:
-                block = COMMENTED_LOCATION_BLOCK_TEMPLATE.format(path=path, proxy_pass_url=proxy_url)
+                if is_https:
+                    block = COMMENTED_HTTPS_LOCATION_BLOCK_TEMPLATE.format(
+                        path=path, 
+                        proxy_pass_url=proxy_url,
+                        upstream_host=upstream_host,
+                        auth_headers=auth_headers
+                    )
+                else:
+                    block = COMMENTED_LOCATION_BLOCK_TEMPLATE.format(path=path, proxy_pass_url=proxy_url)
+            
             location_blocks_content.append(block)
         
         generated_section = "\n".join(location_blocks_content).strip()
@@ -515,23 +615,14 @@ def load_registered_servers_and_state():
     global REGISTERED_SERVERS, MOCK_SERVICE_STATE
     logger.info(f"Loading server definitions from {SERVERS_DIR}...")
 
-    # Create servers directory if it doesn't exist
-    SERVERS_DIR.mkdir(parents=True, exist_ok=True) # Added parents=True
+    SERVERS_DIR.mkdir(parents=True, exist_ok=True)
 
     temp_servers = {}
     server_files = list(SERVERS_DIR.glob("**/*.json"))
     logger.info(f"Found {len(server_files)} JSON files in {SERVERS_DIR} and its subdirectories")
-    for file in server_files:
-        logger.info(f"[DEBUG] - {file.relative_to(SERVERS_DIR)}")
-
-    if not server_files:
-        logger.warning(f"No server definition files found in {SERVERS_DIR}. Initializing empty registry.")
-        REGISTERED_SERVERS = {}
-        # Don't return yet, need to load state file
-        # return
 
     for server_file in server_files:
-        if server_file.name == STATE_FILE_PATH.name: # Skip the state file itself
+        if server_file.name == STATE_FILE_PATH.name:
             continue
         try:
             with open(server_file, "r") as f:
@@ -554,7 +645,17 @@ def load_registered_servers_and_state():
                     server_info["is_python"] = server_info.get("is_python", False)
                     server_info["license"] = server_info.get("license", "N/A")
                     server_info["proxy_pass_url"] = server_info.get("proxy_pass_url", None)
-                    server_info["tool_list"] = server_info.get("tool_list", []) # Initialize tool_list if missing
+                    server_info["tool_list"] = server_info.get("tool_list", [])
+                    server_info["auth_type"] = server_info.get("auth_type", "none")
+
+                    # Restore OAuth configuration
+                    if server_info.get("auth_type") == "oauth2" and "oauth_config" in server_info:
+                        try:
+                            oauth_config = OAuthConfig.from_dict(server_info["oauth_config"])
+                            oauth_manager.register_server_oauth(server_path, oauth_config)
+                            logger.info(f"Restored OAuth config for {server_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to restore OAuth config for {server_path}: {e}")
 
                     temp_servers[server_path] = server_info
                 else:
@@ -641,58 +742,116 @@ def save_server_to_file(server_info):
         return False
 
 
+# --- Helper function to generate description from schema --- START
+def generate_description_from_schema(tool_name: str, tool_schema: dict) -> dict:
+    """Generate a meaningful description from the tool schema when no description is available"""
+    parsed_desc = {
+        "main": "No description available.",
+        "args": None,
+        "returns": None,
+        "raises": None,
+    }
+    
+    if not tool_schema or not isinstance(tool_schema, dict):
+        return parsed_desc
+    
+    properties = tool_schema.get("properties", {})
+    required = tool_schema.get("required", [])
+    
+    if properties:
+        # Generate main description
+        param_count = len(properties)
+        required_count = len(required)
+        
+        if param_count > 0:
+            main_desc_parts = [f"Tool that accepts {param_count} parameter{'s' if param_count != 1 else ''}"]
+            if required_count > 0:
+                main_desc_parts.append(f"({required_count} required)")
+            parsed_desc["main"] = " ".join(main_desc_parts) + "."
+        
+        # Generate args description from schema properties
+        args_parts = []
+        for prop_name, prop_info in properties.items():
+            prop_desc = prop_info.get("description", "")
+            prop_type = prop_info.get("type", "")
+            is_required = prop_name in required
+            
+            arg_line = f"- {prop_name}"
+            if prop_type:
+                arg_line += f" ({prop_type})"
+            if is_required:
+                arg_line += " [required]"
+            if prop_desc:
+                arg_line += f": {prop_desc}"
+            
+            args_parts.append(arg_line)
+        
+        if args_parts:
+            parsed_desc["args"] = "\n".join(args_parts)
+    
+    return parsed_desc
+# --- Helper function to generate description from schema --- END
+
 # --- MCP Client Function to Get Tool List --- START (Renamed)
-async def get_tools_from_server(base_url: str) -> List[dict] | None: # Return list of dicts
+async def get_tools_from_server(base_url: str, server_path: str = None) -> List[dict] | None:
     """
     Connects to an MCP server via SSE, lists tools, and returns their details
-    (name, description, schema).
+    (name, description, schema). Now supports OAuth authentication.
 
     Args:
         base_url: The base URL of the MCP server (e.g., http://localhost:8000).
+        server_path: The server path for OAuth token lookup (optional).
 
     Returns:
         A list of tool detail dictionaries (keys: name, description, schema),
         or None if connection/retrieval fails.
     """
-    # Determine scheme and construct the full /sse URL
     if not base_url:
         logger.error("MCP Check Error: Base URL is empty.")
         return None
 
     sse_url = base_url.rstrip('/') + "/sse"
-    # Simple check for https, might need refinement for edge cases
     secure_prefix = "s" if sse_url.startswith("https://") else ""
-    mcp_server_url = f"http{secure_prefix}://{sse_url[len(f'http{secure_prefix}://'):]}" # Ensure correct format for sse_client
+    mcp_server_url = f"http{secure_prefix}://{sse_url[len(f'http{secure_prefix}://'):]}"
 
+    # Get OAuth headers if server requires authentication
+    auth_headers = {}
+    if server_path and oauth_manager.has_oauth_config(server_path):
+        try:
+            token = await oauth_manager.get_valid_token(server_path)
+            if token:
+                auth_headers = oauth_manager.get_auth_headers(server_path)
+                logger.info(f"Using OAuth authentication for {server_path}")
+        except Exception as e:
+            logger.error(f"Failed to get OAuth token for {server_path}: {e}")
+            return None
 
     logger.info(f"Attempting to connect to MCP server at {mcp_server_url} to get tool list...")
     try:
-        # Connect using the sse_client context manager directly
-        async with sse_client(mcp_server_url) as (read, write):
-             # Use the ClientSession context manager directly
+        # Use SSE connection with auth headers (if provided)
+        async with sse_client(mcp_server_url, headers=auth_headers) as (read, write):
             async with ClientSession(read, write, sampling_callback=None) as session:
-                # Apply timeout to individual operations within the session
-                await asyncio.wait_for(session.initialize(), timeout=10.0) # Timeout for initialize
-                tools_response = await asyncio.wait_for(session.list_tools(), timeout=15.0) # Renamed variable
+                await asyncio.wait_for(session.initialize(), timeout=10.0)
+                tools_response = await asyncio.wait_for(session.list_tools(), timeout=15.0)
 
-                # Extract tool details
                 tool_details_list = []
                 if tools_response and hasattr(tools_response, 'tools'):
                     for tool in tools_response.tools:
-                        # Access attributes directly based on MCP documentation
-                        tool_name = getattr(tool, 'name', 'Unknown Name') # Direct attribute access
+                        tool_name = getattr(tool, 'name', 'Unknown Name')
                         tool_desc = getattr(tool, 'description', None) or getattr(tool, '__doc__', None)
 
-                        # --- Parse Docstring into Sections --- START
+                        # Parse docstring (existing logic)
                         parsed_desc = {
                             "main": "No description available.",
                             "args": None,
                             "returns": None,
                             "raises": None,
                         }
+                        
+                        # Try to get tool-level description first
+                        has_tool_description = False
                         if tool_desc:
                             tool_desc = tool_desc.strip()
-                            # Simple parsing logic (can be refined)
                             lines = tool_desc.split('\n')
                             main_desc_lines = []
                             current_section = "main"
@@ -719,40 +878,44 @@ async def get_tools_from_server(base_url: str) -> List[dict] | None: # Return li
                                     current_section = "raises"
                                     section_content = [stripped_line[len("Raises:"):].strip()]
                                 elif current_section == "main":
-                                    main_desc_lines.append(line.strip()) # Keep leading whitespace for main desc if intended
+                                    main_desc_lines.append(line.strip())
                                 else:
                                     section_content.append(line.strip())
 
-                            # Add the last collected section
                             if current_section != "main":
                                 parsed_desc[current_section] = "\n".join(section_content).strip()
-                            elif not parsed_desc["main"] and main_desc_lines: # Handle case where entire docstring was just main description
+                            elif not parsed_desc["main"] and main_desc_lines:
                                 parsed_desc["main"] = "\n".join(main_desc_lines).strip()
 
-                            # Ensure main description has content if others were parsed but main was empty
                             if not parsed_desc["main"] and (parsed_desc["args"] or parsed_desc["returns"] or parsed_desc["raises"]):
                                 parsed_desc["main"] = "(No primary description provided)"
+                            
+                            # Check if we actually got a meaningful description
+                            if parsed_desc["main"] and parsed_desc["main"] != "No description available.":
+                                has_tool_description = True
 
-                        else:
-                            parsed_desc["main"] = "No description available."
-                        # --- Parse Docstring into Sections --- END
-
-                        tool_schema = getattr(tool, 'inputSchema', {}) # Use inputSchema attribute
+                        tool_schema = getattr(tool, 'inputSchema', {})
+                        
+                        # If no meaningful tool description was found, generate from schema
+                        if not has_tool_description and tool_schema:
+                            logger.info(f"No tool description found for {tool_name}, generating from schema...")
+                            parsed_desc = generate_description_from_schema(tool_name, tool_schema)
 
                         tool_details_list.append({
                             "name": tool_name,
-                            "parsed_description": parsed_desc, # Store parsed sections
+                            "parsed_description": parsed_desc,
                             "schema": tool_schema
                         })
 
                 logger.info(f"Successfully retrieved details for {len(tool_details_list)} tools from {mcp_server_url}.")
-                return tool_details_list # Return the list of details
+                return tool_details_list
+
     except asyncio.TimeoutError:
         logger.error(f"MCP Check Error: Timeout during session operation with {mcp_server_url}.")
         return None
     except ConnectionRefusedError:
-         logger.error(f"MCP Check Error: Connection refused by {mcp_server_url}.")
-         return None
+        logger.error(f"MCP Check Error: Connection refused by {mcp_server_url}.")
+        return None
     except Exception as e:
         logger.error(f"MCP Check Error: Failed to get tool list from {mcp_server_url}: {type(e).__name__} - {e}")
         return None
@@ -761,166 +924,192 @@ async def get_tools_from_server(base_url: str) -> List[dict] | None: # Return li
 
 
 # --- Single Health Check Logic ---
+async def health_check_with_session(url: str, server_path: str) -> tuple[bool, str]:
+    """Check MCP server health using SSE client connection"""
+    try:
+        # Get OAuth headers
+        token = await oauth_manager.get_valid_token(server_path)
+        if not token:
+            return False, "No valid OAuth token"
+        
+        auth_headers = oauth_manager.get_auth_headers(server_path)
+        
+        # Build SSE URL
+        sse_url = url.rstrip('/') + "/sse"
+        secure_prefix = "s" if sse_url.startswith("https://") else ""
+        mcp_server_url = f"http{secure_prefix}://{sse_url[len(f'http{secure_prefix}://'):]}"
+        
+        logger.info(f"Testing OAuth MCP connection to {mcp_server_url}")
+        
+        # Test SSE connection with a short timeout
+        async with sse_client(mcp_server_url, headers=auth_headers) as (read, write):
+            async with ClientSession(read, write, sampling_callback=None) as session:
+                # Just test if we can initialize the session
+                await asyncio.wait_for(session.initialize(), timeout=5.0)
+                logger.info(f"OAuth MCP session initialized successfully for {server_path}")
+                return True, "MCP session healthy"
+                
+    except asyncio.TimeoutError:
+        return False, "MCP connection timeout"
+    except Exception as e:
+        logger.debug(f"OAuth MCP health check failed for {server_path}: {e}")
+        return False, f"MCP connection failed: {type(e).__name__}"
+
+
 async def perform_single_health_check(path: str) -> tuple[str, datetime | None]:
     """Performs a health check for a single service path and updates global state."""
-    global SERVER_HEALTH_STATUS, SERVER_LAST_CHECK_TIME, REGISTERED_SERVERS # Ensure REGISTERED_SERVERS is global
+    global SERVER_HEALTH_STATUS, SERVER_LAST_CHECK_TIME, REGISTERED_SERVERS
 
     server_info = REGISTERED_SERVERS.get(path)
-    # --- Store previous status --- START
-    previous_status = SERVER_HEALTH_STATUS.get(path) # Get status before check
-    # --- Store previous status --- END
+    previous_status = SERVER_HEALTH_STATUS.get(path)
 
     if not server_info:
-        # Should not happen if called correctly, but handle defensively
         return "error: server not registered", None
 
     url = server_info.get("proxy_pass_url")
-    is_enabled = MOCK_SERVICE_STATE.get(path, False) # Get enabled state for later check
+    is_enabled = MOCK_SERVICE_STATE.get(path, False)
 
-    # --- Record check time ---
     last_checked_time = datetime.now(timezone.utc)
     SERVER_LAST_CHECK_TIME[path] = last_checked_time
-    # --- Record check time ---
 
     if not url:
         current_status = "error: missing URL"
         SERVER_HEALTH_STATUS[path] = current_status
         logger.info(f"Health check skipped for {path}: Missing URL.")
-        # --- Regenerate Nginx if status affecting it changed --- START
-        if is_enabled and previous_status == "healthy": # Was healthy, now isn't (due to missing URL)
-             logger.info(f"Status changed from healthy for {path}, regenerating Nginx config...")
-             regenerate_nginx_config()
-        # --- Regenerate Nginx if status affecting it changed --- END
+        if is_enabled and previous_status == "healthy":
+            logger.info(f"Status changed from healthy for {path}, regenerating Nginx config...")
+            regenerate_nginx_config()
         return current_status, last_checked_time
 
-    # Update status to 'checking' before performing the check
-    # Only print if status actually changes to 'checking'
     if previous_status != "checking":
         logger.info(f"Setting status to 'checking' for {path} ({url})...")
         SERVER_HEALTH_STATUS[path] = "checking"
-        # Optional: Consider a targeted broadcast here if immediate 'checking' feedback is desired
-        # await broadcast_specific_update(path, "checking", last_checked_time)
 
-    # --- Append /sse to the health check URL --- START
-    health_check_url = url.rstrip('/') + "/sse"
-    # --- Append /sse to the health check URL --- END
+    # Use different health check methods based on OAuth requirement
+    if oauth_manager.has_oauth_config(path):
+        # For OAuth servers, use MCP SSE client directly
+        logger.info(f"Using MCP SSE health check for OAuth server {path}")
+        try:
+            is_healthy, health_message = await health_check_with_session(url, path)
+            if is_healthy:
+                current_status = "healthy"
+                logger.info(f"OAuth MCP health check successful for {path}: {health_message}")
+                
+                # Run tool fetching logic if transitioning to healthy
+                if previous_status != "healthy":
+                    logger.info(f"OAuth service {path} transitioned to healthy. Regenerating Nginx config and fetching tool list...")
+                    regenerate_nginx_config()
 
-    # cmd = ['curl', '--head', '-s', '-f', '--max-time', str(HEALTH_CHECK_TIMEOUT_SECONDS), url]
-    cmd = ['curl', '--head', '-s', '-f', '--max-time', str(HEALTH_CHECK_TIMEOUT_SECONDS), health_check_url] # Use modified URL
-    current_status = "checking" # Status will be updated below
+                    if url:
+                        tool_list = await get_tools_from_server(url, path)
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        # Use a slightly longer timeout for wait_for to catch process hangs
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=HEALTH_CHECK_TIMEOUT_SECONDS + 2)
-        stderr_str = stderr.decode().strip() if stderr else ''
+                        if tool_list is not None:
+                            new_tool_count = len(tool_list)
+                            current_tool_list = REGISTERED_SERVERS[path].get("tool_list", [])
+                            current_tool_count = REGISTERED_SERVERS[path].get("num_tools", 0)
 
-        if proc.returncode == 0:
-            current_status = "healthy"
-            logger.info(f"Health check successful for {path} ({url}).")
+                            current_tool_list_str = sorted([json.dumps(t, sort_keys=True) for t in current_tool_list])
+                            new_tool_list_str = sorted([json.dumps(t, sort_keys=True) for t in tool_list])
 
-            # --- Check for transition to healthy state --- START
-            # Note: Tool list fetching moved inside the status transition check
-            if previous_status != "healthy":
-                logger.info(f"Service {path} transitioned to healthy. Regenerating Nginx config and fetching tool list...")
-                 # --- Regenerate Nginx on transition TO healthy --- START
-                regenerate_nginx_config()
-                 # --- Regenerate Nginx on transition TO healthy --- END
-
-                # Ensure url is not None before attempting connection (redundant check as url is checked above, but safe)
-                if url:
-                    tool_list = await get_tools_from_server(url) # Get the list of dicts
-
-                    if tool_list is not None: # Check if list retrieval was successful
-                        new_tool_count = len(tool_list)
-                        # Get current list (now list of dicts)
-                        current_tool_list = REGISTERED_SERVERS[path].get("tool_list", [])
-                        current_tool_count = REGISTERED_SERVERS[path].get("num_tools", 0)
-
-                        # Compare lists more carefully (simple set comparison won't work on dicts)
-                        # Convert to comparable format (e.g., sorted list of JSON strings)
-                        current_tool_list_str = sorted([json.dumps(t, sort_keys=True) for t in current_tool_list])
-                        new_tool_list_str = sorted([json.dumps(t, sort_keys=True) for t in tool_list])
-
-                        # if set(current_tool_list) != set(tool_list) or current_tool_count != new_tool_count:
-                        if current_tool_list_str != new_tool_list_str or current_tool_count != new_tool_count:
-                            logger.info(f"Updating tool list for {path}. New count: {new_tool_count}.") # Simplified log
-                            REGISTERED_SERVERS[path]["tool_list"] = tool_list # Store the new list of dicts
-                            REGISTERED_SERVERS[path]["num_tools"] = new_tool_count # Update the count
-                            # Save the updated server info to its file
-                            if not save_server_to_file(REGISTERED_SERVERS[path]):
-                                logger.error(f"ERROR: Failed to save updated tool list/count for {path} to file.")
-                            # --- Update FAISS after tool list/count change --- START
-                            # No explicit call here, will be handled by the one at the end of perform_single_health_check
-                            # logger.info(f"Updating FAISS metadata for '{path}' after tool list/count update.")
-                            # await add_or_update_service_in_faiss(path, REGISTERED_SERVERS[path]) # Moved to end
-                            # --- Update FAISS after tool list/count change --- END
+                            if current_tool_list_str != new_tool_list_str or current_tool_count != new_tool_count:
+                                logger.info(f"Updating tool list for {path}. New count: {new_tool_count}.")
+                                REGISTERED_SERVERS[path]["tool_list"] = tool_list
+                                REGISTERED_SERVERS[path]["num_tools"] = new_tool_count
+                                if not save_server_to_file(REGISTERED_SERVERS[path]):
+                                    logger.error(f"Failed to save updated server info for {path}")
+                            else:
+                                logger.info(f"Tool list for {path} unchanged.")
                         else:
-                             logger.info(f"Tool list for {path} remains unchanged. No update needed.")
-                    else:
-                        logger.info(f"Failed to retrieve tool list for healthy service {path}. List/Count remains unchanged.")
-                        # Even if tool list fetch failed, server is healthy.
-                        # FAISS update will occur at the end of this function with current REGISTERED_SERVERS[path].
-                else:
-                    # This case should technically not be reachable due to earlier url check
-                    logger.info(f"Cannot fetch tool list for {path}: proxy_pass_url is missing.")
-            # --- Check for transition to healthy state --- END
-            # If it was already healthy, and tools changed, the above block (current_tool_list_str != new_tool_list_str) handles it.
-            # The FAISS update with the latest REGISTERED_SERVERS[path] will happen at the end of this function.
+                            logger.info(f"Failed to retrieve tool list for healthy OAuth service {path}.")
+            else:
+                current_status = f"unhealthy: {health_message}"
+                logger.info(f"OAuth MCP health check failed for {path}: {health_message}")
+                
+        except Exception as e:
+            current_status = f"error: MCP check failed - {e}"
+            logger.error(f"OAuth MCP health check error for {path}: {e}")
+    else:
+        # For non-OAuth servers, use traditional curl HEAD request
+        health_check_url = url.rstrip('/') + "/sse"
+        cmd = ['curl', '--head', '-s', '-f', '--max-time', str(HEALTH_CHECK_TIMEOUT_SECONDS)]
+        cmd.append(health_check_url)
+        current_status = "checking"
 
-        elif proc.returncode == 28:
-            current_status = f"error: timeout ({HEALTH_CHECK_TIMEOUT_SECONDS}s)"
-            logger.info(f"Health check timeout for {path} ({url})")
-        elif proc.returncode == 22: # HTTP error >= 400
-            current_status = "unhealthy (HTTP error)"
-            logger.info(f"Health check unhealthy (HTTP >= 400) for {path} ({url}). Stderr: {stderr_str}")
-        elif proc.returncode == 7: # Connection failed
-            current_status = "error: connection failed"
-            logger.info(f"Health check connection failed for {path} ({url}). Stderr: {stderr_str}")
-        else: # Other curl errors
-            error_msg = f"error: check failed (code {proc.returncode})"
-            if stderr_str:
-                error_msg += f" - {stderr_str}"
-            current_status = error_msg
-            logger.info(f"Health check failed for {path} ({url}): {error_msg}")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=HEALTH_CHECK_TIMEOUT_SECONDS + 2)
+            stderr_str = stderr.decode().strip() if stderr else ''
 
-    except asyncio.TimeoutError:
-        # This catches timeout on asyncio.wait_for, slightly different from curl's --max-time
-        current_status = "error: check process timeout"
-        logger.info(f"Health check asyncio.wait_for timeout for {path} ({url})")
-    except FileNotFoundError:
-        current_status = "error: command not found"
-        logger.error(f"ERROR: 'curl' command not found during health check for {path}. Cannot perform check.")
-        # No need to stop all checks, just this one fails
-    except Exception as e:
-        current_status = f"error: {type(e).__name__}"
-        logger.error(f"ERROR: Unexpected error during health check for {path} ({url}): {e}")
+            if proc.returncode == 0:
+                current_status = "healthy"
+                logger.info(f"Health check successful for {path} ({url}).")
 
-    # Update the global status *after* the check completes
+                if previous_status != "healthy":
+                    logger.info(f"Service {path} transitioned to healthy. Regenerating Nginx config and fetching tool list...")
+                    regenerate_nginx_config()
+
+                    if url:
+                        tool_list = await get_tools_from_server(url, path)
+
+                        if tool_list is not None:
+                            new_tool_count = len(tool_list)
+                            current_tool_list = REGISTERED_SERVERS[path].get("tool_list", [])
+                            current_tool_count = REGISTERED_SERVERS[path].get("num_tools", 0)
+
+                            current_tool_list_str = sorted([json.dumps(t, sort_keys=True) for t in current_tool_list])
+                            new_tool_list_str = sorted([json.dumps(t, sort_keys=True) for t in tool_list])
+
+                            if current_tool_list_str != new_tool_list_str or current_tool_count != new_tool_count:
+                                logger.info(f"Updating tool list for {path}. New count: {new_tool_count}.")
+                                REGISTERED_SERVERS[path]["tool_list"] = tool_list
+                                REGISTERED_SERVERS[path]["num_tools"] = new_tool_count
+                                if not save_server_to_file(REGISTERED_SERVERS[path]):
+                                    logger.error(f"Failed to save updated server info for {path}")
+                            else:
+                                logger.info(f"Tool list for {path} unchanged.")
+                        else:
+                            logger.info(f"Failed to retrieve tool list for healthy service {path}.")
+
+            elif proc.returncode == 22:
+                current_status = "unhealthy (HTTP error)"
+                logger.info(f"Health check unhealthy (HTTP >= 400) for {path} ({url}). Stderr: {stderr_str}")
+            elif proc.returncode == 7:
+                current_status = "error: connection failed"
+                logger.info(f"Health check connection failed for {path} ({url}). Stderr: {stderr_str}")
+            elif proc.returncode == 28:
+                current_status = f"error: timeout ({HEALTH_CHECK_TIMEOUT_SECONDS}s)"
+                logger.info(f"Health check timeout for {path} ({url})")
+            else:
+                error_msg = f"error: check failed (code {proc.returncode})"
+                if stderr_str:
+                    error_msg += f" - {stderr_str}"
+                current_status = error_msg
+                logger.info(f"Health check failed for {path} ({url}): {error_msg}")
+
+        except asyncio.TimeoutError:
+            current_status = "error: check process timeout"
+            logger.info(f"Health check asyncio.wait_for timeout for {path} ({url})")
+        except FileNotFoundError:
+            current_status = "error: command not found"
+            logger.error(f"ERROR: 'curl' command not found during health check for {path}.")
+        except Exception as e:
+            current_status = f"error: {type(e).__name__}"
+            logger.error(f"ERROR: Unexpected error during health check for {path} ({url}): {e}")
+
     SERVER_HEALTH_STATUS[path] = current_status
     logger.info(f"Final health status for {path}: {current_status}")
 
-    # --- Update FAISS with final server_info state after health check attempt ---
     if path in REGISTERED_SERVERS and embedding_model and faiss_index is not None:
-        logger.info(f"Updating FAISS metadata for '{path}' post health check (status: {current_status}).")
         await add_or_update_service_in_faiss(path, REGISTERED_SERVERS[path])
 
-    # --- Regenerate Nginx if status affecting it changed --- START
-    # Check if the service is enabled AND its Nginx-relevant status changed
     if is_enabled:
         if previous_status == "healthy" and current_status != "healthy":
             logger.info(f"Status changed FROM healthy for enabled service {path}, regenerating Nginx config...")
             regenerate_nginx_config()
-        # Regeneration on transition TO healthy is handled within the proc.returncode == 0 block above
-        # elif previous_status != "healthy" and current_status == "healthy":
-        #     print(f"Status changed TO healthy for {path}, regenerating Nginx config...")
-        #     regenerate_nginx_config() # Already handled above
-    # --- Regenerate Nginx if status affecting it changed --- END
-
 
     return current_status, last_checked_time
 
@@ -1380,6 +1569,109 @@ async def toggle_service_route(
     # return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
 
 
+async def detect_auth_requirement(base_url: str) -> tuple[bool, str]:
+    """
+    Test if an endpoint requires authentication by trying common endpoints.
+    Returns (requires_auth, reason)
+    """
+    logger.info(f"Testing if {base_url} requires authentication...")
+    
+    # Test endpoints in order of preference
+    test_endpoints = [
+        "/sse",          # SSE endpoint
+        "/mcp",          # MCP endpoint
+        "/api"           # API endpoint
+    ]
+    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for endpoint in test_endpoints:
+            test_url = base_url.rstrip('/') + endpoint
+            try:
+                logger.debug(f"Testing endpoint: {test_url}")
+                response = await client.get(test_url)
+                
+                if response.status_code == 401:
+                    logger.info(f"Authentication required - got 401 from {test_url}")
+                    return True, f"401 Unauthorized from {endpoint}"
+                elif response.status_code == 403:
+                    logger.info(f"Authentication required - got 403 from {test_url}")
+                    return True, f"403 Forbidden from {endpoint}"
+                elif response.status_code == 200:
+                    logger.info(f"No authentication required - got 200 from {test_url}")
+                    return False, f"200 OK from {endpoint}"
+                else:
+                    logger.debug(f"Got {response.status_code} from {test_url}, continuing...")
+                    
+            except Exception as e:
+                logger.debug(f"Error testing {test_url}: {e}")
+                continue
+    
+    # If we can't determine, assume no auth required
+    logger.info(f"Could not determine auth requirement for {base_url}, assuming no auth")
+    return False, "Unable to determine, assuming no auth"
+
+
+async def detect_oauth_capabilities(discovered_endpoints: dict) -> dict:
+    """
+    Analyze discovered OAuth metadata to determine supported capabilities.
+    Returns dict with detected capabilities.
+    """
+    capabilities = {
+        "grant_types": ["authorization_code"],  # Default fallback
+        "scopes": ["read", "write"],           # Default fallback
+        "supports_pkce": True,                 # Assume PKCE support (OAuth 2.1 standard)
+        "supports_dynamic_registration": False
+    }
+    
+    # Extract supported grant types
+    if 'supported_grant_types' in discovered_endpoints:
+        supported_grants = discovered_endpoints['supported_grant_types']
+        if isinstance(supported_grants, list):
+            capabilities["grant_types"] = supported_grants
+            logger.info(f"Detected supported grant types: {supported_grants}")
+        
+        # Prefer client_credentials for server-to-server communication
+        if "client_credentials" in capabilities["grant_types"]:
+            capabilities["preferred_grant_type"] = "client_credentials"
+        elif "authorization_code" in capabilities["grant_types"]:
+            capabilities["preferred_grant_type"] = "authorization_code"
+        else:
+            capabilities["preferred_grant_type"] = capabilities["grant_types"][0]
+    else:
+        capabilities["preferred_grant_type"] = "authorization_code"
+    
+    # Extract supported scopes
+    if 'supported_scopes' in discovered_endpoints:
+        supported_scopes = discovered_endpoints['supported_scopes']
+        if isinstance(supported_scopes, list):
+            capabilities["scopes"] = supported_scopes
+            logger.info(f"Detected supported scopes: {supported_scopes}")
+    
+    # Check for dynamic registration support
+    if 'registration_endpoint' in discovered_endpoints:
+        capabilities["supports_dynamic_registration"] = True
+        logger.info(f"Dynamic client registration supported at: {discovered_endpoints['registration_endpoint']}")
+    
+    # Determine optimal scope
+    available_scopes = capabilities["scopes"]
+    optimal_scope_parts = []
+    
+    # Prefer read and write if available
+    if "read" in available_scopes:
+        optimal_scope_parts.append("read")
+    if "write" in available_scopes:
+        optimal_scope_parts.append("write")
+    
+    # If neither read nor write available, use all available scopes
+    if not optimal_scope_parts and available_scopes:
+        optimal_scope_parts = available_scopes[:2]  # Take first 2 scopes
+    
+    capabilities["optimal_scope"] = " ".join(optimal_scope_parts) if optimal_scope_parts else "read write"
+    
+    logger.info(f"Detected OAuth capabilities: {capabilities}")
+    return capabilities
+
+
 @app.post("/register")
 async def register_service(
     name: Annotated[str, Form()],
@@ -1393,36 +1685,33 @@ async def register_service(
     license_str: Annotated[str, Form(alias="license")] = "N/A",
     username: Annotated[str, Depends(api_auth)] = None,
 ):
-    logger.info("[DEBUG] register_service() called with parameters:")
-    logger.info(f"[DEBUG] - name: {name}")
-    logger.info(f"[DEBUG] - description: {description}")
-    logger.info(f"[DEBUG] - path: {path}")
-    logger.info(f"[DEBUG] - proxy_pass_url: {proxy_pass_url}")
-    logger.info(f"[DEBUG] - tags: {tags}")
-    logger.info(f"[DEBUG] - num_tools: {num_tools}")
-    logger.info(f"[DEBUG] - num_stars: {num_stars}")
-    logger.info(f"[DEBUG] - is_python: {is_python}")
-    logger.info(f"[DEBUG] - license_str: {license_str}")
-    logger.info(f"[DEBUG] - username: {username}")
+    """
+    Intelligent service registration endpoint that automatically:
+    1. Detects if the service requires OAuth authentication
+    2. Discovers OAuth endpoints if auth is required
+    3. Attempts dynamic client registration or falls back to .env credentials
+    4. Configures optimal OAuth settings based on server capabilities
+    5. Automatically initiates OAuth authorization flow if OAuth is detected
+    6. Returns authorization URL for human completion
+    """
+    
+    logger.info(f"[AUTO-REGISTER] Starting intelligent registration for '{name}' at {proxy_pass_url}")
 
     # Ensure path starts with a slash
     if not path.startswith("/"):
         path = "/" + path
-        logger.info(f"[DEBUG] Path adjusted to start with slash: {path}")
 
     # Check if path already exists
     if path in REGISTERED_SERVERS:
-        logger.error(f"[ERROR] Service registration failed: path '{path}' already exists")
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Service with path '{path}' already exists"},
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Service path '{path}' is already registered"
         )
 
-    # Process tags: split string, strip whitespace, filter empty
+    # Process tags
     tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
-    logger.info(f"[DEBUG] Processed tags: {tag_list}")
 
-    # Create new server entry with all fields
+    # Create base server entry
     server_entry = {
         "server_name": name,
         "description": description,
@@ -1433,74 +1722,303 @@ async def register_service(
         "num_stars": num_stars,
         "is_python": is_python,
         "license": license_str,
-        "tool_list": [] # Initialize tool list
+        "tool_list": [],
+        "auth_type": "none"  # Default, will be updated if OAuth is detected
     }
-    logger.info(f"[DEBUG] Created server entry: {json.dumps(server_entry, indent=2)}")
 
-    # Save to individual file
-    logger.info("[DEBUG] Attempting to save server data to file...")
+    # Detailed response info
+    detection_info = {
+        "auth_detection_performed": True,
+        "oauth_detection_performed": False,
+        "dynamic_registration_attempted": False,
+        "dynamic_registration_successful": False,
+        "fallback_credentials_used": False,
+        "oauth_config_created": False,
+        "oauth_authorization_initiated": False,
+        "authorization_url": None,
+        "detection_details": {},
+        "oauth_capabilities": {},
+        "errors": []
+    }
+
+    try:
+        # Step 1: Test if the service requires authentication
+        logger.info(f"[AUTO-REGISTER] Step 1: Testing auth requirement for {proxy_pass_url}")
+        requires_auth, auth_reason = await detect_auth_requirement(proxy_pass_url)
+        detection_info["detection_details"]["auth_required"] = requires_auth
+        detection_info["detection_details"]["auth_reason"] = auth_reason
+        
+        if not requires_auth:
+            logger.info(f"[AUTO-REGISTER] No authentication required for {proxy_pass_url}. Using standard registration.")
+            # Proceed with non-OAuth registration
+        else:
+            logger.info(f"[AUTO-REGISTER] Authentication required for {proxy_pass_url}. Attempting OAuth discovery...")
+            
+            # Step 2: Discover OAuth endpoints
+            try:
+                detection_info["oauth_detection_performed"] = True
+                discovered_endpoints = await OAuthDiscovery.discover_oauth_endpoints(proxy_pass_url)
+                detection_info["detection_details"]["discovered_endpoints"] = discovered_endpoints
+                
+                if not discovered_endpoints.get('token_url'):
+                    error_msg = f"OAuth endpoints not found for {proxy_pass_url} despite auth requirement"
+                    logger.warning(f"[AUTO-REGISTER] {error_msg}")
+                    detection_info["errors"].append(error_msg)
+                    # Fall back to non-OAuth (server might use different auth method)
+                else:
+                    logger.info(f"[AUTO-REGISTER] OAuth endpoints discovered: {list(discovered_endpoints.keys())}")
+                    
+                    # Step 3: Analyze OAuth capabilities
+                    oauth_capabilities = await detect_oauth_capabilities(discovered_endpoints)
+                    detection_info["oauth_capabilities"] = oauth_capabilities
+                    
+                    # Step 4: Attempt OAuth configuration
+                    oauth_config = None
+                    
+                    # Try dynamic registration first if supported
+                    if oauth_capabilities["supports_dynamic_registration"]:
+                        logger.info(f"[AUTO-REGISTER] Attempting dynamic client registration...")
+                        detection_info["dynamic_registration_attempted"] = True
+                        
+                        try:
+                            oauth_config = await oauth_manager.discover_register_and_configure_oauth(
+                                server_path=path,
+                                base_url=proxy_pass_url,
+                                scope=oauth_capabilities["optimal_scope"]
+                            )
+                            detection_info["dynamic_registration_successful"] = True
+                            logger.info(f"[AUTO-REGISTER] Dynamic client registration successful for {path}")
+                            
+                        except Exception as e:
+                            error_msg = f"Dynamic client registration failed: {e}"
+                            logger.warning(f"[AUTO-REGISTER] {error_msg}")
+                            detection_info["errors"].append(error_msg)
+                            # Fall through to .env credentials
+                    
+                    # If dynamic registration failed or not supported, use .env credentials
+                    if oauth_config is None:
+                        logger.info(f"[AUTO-REGISTER] Using .env CLIENT_ID and CLIENT_SECRET as fallback")
+                        detection_info["fallback_credentials_used"] = True
+                        
+                        try:
+                            # Get credentials from environment
+                            fallback_client_id = os.environ.get("CLIENT_ID")
+                            fallback_client_secret = os.environ.get("CLIENT_SECRET")
+                            
+                            if not fallback_client_id:
+                                raise ValueError("CLIENT_ID not found in environment variables")
+                            
+                            oauth_config = OAuthConfig(
+                                client_id=fallback_client_id,
+                                client_secret=fallback_client_secret,
+                                authorization_url=discovered_endpoints.get('authorization_url', ''),
+                                token_url=discovered_endpoints['token_url'],
+                                scope=oauth_capabilities["optimal_scope"],
+                                grant_type=oauth_capabilities["preferred_grant_type"]
+                            )
+                            
+                            # Register with OAuth manager
+                            oauth_manager.register_server_oauth(path, oauth_config)
+                            logger.info(f"[AUTO-REGISTER] OAuth configured using .env credentials for {path}")
+                            
+                        except Exception as e:
+                            error_msg = f"Failed to configure OAuth with .env credentials: {e}"
+                            logger.error(f"[AUTO-REGISTER] {error_msg}")
+                            detection_info["errors"].append(error_msg)
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"OAuth setup failed: {error_msg}"
+                            )
+                    
+                    # If we got here, OAuth configuration was successful
+                    server_entry["auth_type"] = "oauth2"
+                    server_entry["oauth_config"] = oauth_config.to_dict()
+                    detection_info["oauth_config_created"] = True
+                    
+                    logger.info(f"[AUTO-REGISTER] OAuth configuration successful for {path}")
+                    logger.info(f"[AUTO-REGISTER] Grant type: {oauth_config.grant_type}")
+                    logger.info(f"[AUTO-REGISTER] Scope: {oauth_config.scope}")
+                    logger.info(f"[AUTO-REGISTER] Token URL: {oauth_config.token_url}")
+                    
+                    # Step 5: Automatically initiate OAuth authorization flow
+                    if oauth_config.grant_type == "authorization_code":
+                        logger.info(f"[AUTO-REGISTER] Automatically initiating OAuth authorization flow for {path}")
+                        try:
+                            auth_url, state = await oauth_manager.get_authorization_url(path)
+                            detection_info["oauth_authorization_initiated"] = True
+                            detection_info["authorization_url"] = auth_url
+                            
+                            logger.info(f"[AUTO-REGISTER] OAuth authorization URL generated for {path}")
+                            logger.info(f"[AUTO-REGISTER] Authorization URL: {auth_url}")
+                            logger.info(f"[AUTO-REGISTER] State: {state}")
+                            
+                        except Exception as e:
+                            error_msg = f"Failed to generate authorization URL: {e}"
+                            logger.warning(f"[AUTO-REGISTER] {error_msg}")
+                            detection_info["errors"].append(error_msg)
+                            # Don't fail registration - user can manually authorize later
+                    else:
+                        logger.info(f"[AUTO-REGISTER] Grant type is {oauth_config.grant_type}, no user authorization needed")
+                    
+            except Exception as e:
+                error_msg = f"OAuth discovery failed: {e}"
+                logger.warning(f"[AUTO-REGISTER] {error_msg}")
+                detection_info["errors"].append(error_msg)
+                # Fall back to non-OAuth registration (server might not actually have OAuth)
+                logger.info(f"[AUTO-REGISTER] Falling back to non-OAuth registration for {path}")
+
+    except Exception as e:
+        error_msg = f"Authentication detection failed: {e}"
+        logger.error(f"[AUTO-REGISTER] {error_msg}")
+        detection_info["errors"].append(error_msg)
+        detection_info["auth_detection_performed"] = False
+        # Continue with non-OAuth registration
+
+    # Step 6: Save server configuration
+    logger.info(f"[AUTO-REGISTER] Saving server configuration...")
     success = save_server_to_file(server_entry)
     if not success:
-        logger.error("[ERROR] Failed to save server data to file")
-        return JSONResponse(
-            status_code=500, content={"error": "Failed to save server data"}
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to save server configuration to file"
         )
-    logger.info("[DEBUG] Successfully saved server data to file")
 
-    # Add to in-memory registry and default to disabled
-    logger.info("[DEBUG] Adding server to in-memory registry...")
+    # Step 7: Update in-memory state
     REGISTERED_SERVERS[path] = server_entry
-    logger.info("[DEBUG] Setting initial service state to disabled")
     MOCK_SERVICE_STATE[path] = False
-    # Set initial health status for the new service (always start disabled)
-    logger.info("[DEBUG] Setting initial health status to 'disabled'")
-    SERVER_HEALTH_STATUS[path] = "disabled" # Start disabled
-    SERVER_LAST_CHECK_TIME[path] = None # No check time yet
-    # Ensure num_tools is present in the in-memory dict immediately
-    if "num_tools" not in REGISTERED_SERVERS[path]:
-        logger.info("[DEBUG] Adding missing num_tools field to in-memory registry")
-        REGISTERED_SERVERS[path]["num_tools"] = 0
+    SERVER_HEALTH_STATUS[path] = "disabled"
+    SERVER_LAST_CHECK_TIME[path] = None
 
-    # Regenerate Nginx config after successful registration
-    logger.info("[DEBUG] Attempting to regenerate Nginx configuration...")
+    # Step 8: Regenerate Nginx config
     if not regenerate_nginx_config():
-        logger.error("[ERROR] Failed to update Nginx configuration after registration")
-    else:
-        logger.info("[DEBUG] Successfully regenerated Nginx configuration")
+        logger.warning("[AUTO-REGISTER] Failed to regenerate Nginx configuration")
 
-    # --- Add to FAISS Index --- START
-    logger.info(f"[DEBUG] Adding/updating service '{path}' in FAISS index after registration...")
+    # Step 9: Add to FAISS Index
     if embedding_model and faiss_index is not None:
-        await add_or_update_service_in_faiss(path, server_entry) # server_entry is the new service info
-        logger.info(f"[DEBUG] Service '{path}' processed for FAISS index.")
+        await add_or_update_service_in_faiss(path, server_entry)
     else:
-        logger.warning(f"[DEBUG] Skipped FAISS update for '{path}': model or index not ready.")
-    # --- Add to FAISS Index --- END
+        logger.warning("[AUTO-REGISTER] FAISS index not available for new service")
 
-    logger.info(f"[INFO] New service registered: '{name}' at path '{path}' by user '{username}'")
-
-    # --- Persist the updated state after registration --- START
+    # Step 10: Persist state and broadcast
     try:
-        logger.info(f"[DEBUG] Attempting to persist state to {STATE_FILE_PATH}...")
         with open(STATE_FILE_PATH, "w") as f:
             json.dump(MOCK_SERVICE_STATE, f, indent=2)
-        logger.info(f"[DEBUG] Successfully persisted state to {STATE_FILE_PATH}")
+        logger.info(f"[AUTO-REGISTER] Persisted state to {STATE_FILE_PATH}")
     except Exception as e:
-        logger.error(f"[ERROR] Failed to persist state to {STATE_FILE_PATH}: {str(e)}")
-    # --- Persist the updated state after registration --- END
+        logger.error(f"[AUTO-REGISTER] Failed to persist state: {e}")
 
-    # Broadcast the updated status after registration
-    logger.info("[DEBUG] Creating task to broadcast health status...")
     asyncio.create_task(broadcast_health_status())
 
-    logger.info("[DEBUG] Registration complete, returning success response")
+    # Prepare detailed response
+    response_data = {
+        "message": "Service registered successfully with intelligent auto-detection",
+        "service": server_entry,
+        "detection_info": detection_info
+    }
+
+    # Add OAuth status if OAuth was configured
+    if server_entry["auth_type"] == "oauth2":
+        oauth_status = oauth_manager.get_server_oauth_status(path)
+        response_data["oauth_status"] = oauth_status
+
+    # Special handling for OAuth authorization
+    if detection_info.get("oauth_authorization_initiated") and detection_info.get("authorization_url"):
+        response_data["message"] = "Service registered successfully! OAuth detected - complete authorization to enable the service."
+        response_data["action_required"] = {
+            "type": "oauth_authorization", 
+            "authorization_url": detection_info["authorization_url"],
+            "instructions": f"Visit the authorization URL to complete OAuth setup for {name}. The service will be available after authorization."
+        }
+
+    logger.info(f"[AUTO-REGISTER] Registration complete for '{name}' at path '{path}' by user '{username}'")
+    logger.info(f"[AUTO-REGISTER] Final auth type: {server_entry['auth_type']}")
+    if detection_info["errors"]:
+        logger.info(f"[AUTO-REGISTER] Errors encountered: {detection_info['errors']}")
+    if detection_info.get("authorization_url"):
+        logger.info(f"[AUTO-REGISTER] Authorization required: {detection_info['authorization_url']}")
+
     return JSONResponse(
         status_code=201,
-        content={
-            "message": "Service registered successfully",
-            "service": server_entry,
-        },
+        content=response_data
     )
+
+@app.delete("/api/delete/{service_path:path}")
+async def delete_service(
+    service_path: str,
+    username: Annotated[str, Depends(api_auth)]
+):
+    """Delete a service from the registry"""
+    if not service_path.startswith('/'):
+        service_path = '/' + service_path
+    
+    # Check if server exists
+    if service_path not in REGISTERED_SERVERS:
+        raise HTTPException(status_code=404, detail=f"Service path '{service_path}' not found")
+    
+    server_name = REGISTERED_SERVERS[service_path]["server_name"]
+    
+    try:
+        # 1. Remove from OAuth manager if it has OAuth config
+        if oauth_manager.has_oauth_config(service_path):
+            oauth_manager.unregister_server(service_path)
+            logger.info(f"Removed OAuth config for {service_path}")
+        
+        # 2. Remove from file system
+        filename = path_to_filename(service_path)
+        file_path = SERVERS_DIR / filename
+        if file_path.exists():
+            file_path.unlink()
+            logger.info(f"Deleted server file: {file_path}")
+        
+        # 3. Remove from in-memory structures
+        del REGISTERED_SERVERS[service_path]
+        MOCK_SERVICE_STATE.pop(service_path, None)
+        SERVER_HEALTH_STATUS.pop(service_path, None)
+        SERVER_LAST_CHECK_TIME.pop(service_path, None)
+        
+        # 4. Remove from FAISS index
+        if embedding_model and faiss_index is not None:
+            if service_path in faiss_metadata_store:
+                faiss_id = faiss_metadata_store[service_path]["id"]
+                try:
+                    # Remove from FAISS index
+                    ids_to_remove = np.array([faiss_id])
+                    faiss_index.remove_ids(ids_to_remove)
+                    # Remove from metadata store
+                    del faiss_metadata_store[service_path]
+                    # Save FAISS data
+                    await asyncio.to_thread(save_faiss_data)
+                    logger.info(f"Removed {service_path} from FAISS index")
+                except Exception as e:
+                    logger.warning(f"Failed to remove {service_path} from FAISS index: {e}")
+        
+        # 5. Update state file
+        try:
+            STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(STATE_FILE_PATH, "w") as f:
+                json.dump(MOCK_SERVICE_STATE, f, indent=2)
+            logger.info("Updated server state file after deletion")
+        except Exception as e:
+            logger.warning(f"Failed to update state file after deletion: {e}")
+        
+        # 6. Regenerate Nginx config
+        if not regenerate_nginx_config():
+            logger.warning("Failed to regenerate Nginx configuration after deletion")
+        
+        # 7. Broadcast update
+        asyncio.create_task(broadcast_health_status())
+        
+        logger.info(f"Successfully deleted server '{server_name}' ({service_path}) by user '{username}'")
+        
+        return {
+            "message": f"Server '{server_name}' deleted successfully",
+            "deleted_service_path": service_path,
+            "deleted_server_name": server_name
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to delete server {service_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete server: {e}")
 
 @app.get("/api/server_details/{service_path:path}")
 async def get_server_details(
@@ -1578,6 +2096,37 @@ async def get_service_tools(
 
     return {"service_path": service_path, "tools": tool_list}
 # --- Endpoint to get tool list for a service --- END
+
+
+# --- Endpoint to get server enabled status --- START
+@app.get("/api/status/{service_path:path}")
+async def get_server_status(
+    service_path: str,
+    username: Annotated[str, Depends(api_auth)]
+):
+    """Get enabled status for a specific server or all servers if service_path is 'all'"""
+    if not service_path.startswith('/'):
+        service_path = '/' + service_path
+
+    # Handle special case for '/all' to return status for all servers
+    if service_path == '/all':
+        status_info = {}
+        for path in REGISTERED_SERVERS.keys():
+            is_enabled = MOCK_SERVICE_STATE.get(path, False)
+            status_info[path] = "on" if is_enabled else "off"
+        
+        return {"servers": status_info}
+
+    # Handle specific server case
+    if service_path not in REGISTERED_SERVERS:
+        raise HTTPException(status_code=404, detail="Service path not registered")
+    
+    is_enabled = MOCK_SERVICE_STATE.get(service_path, False)
+    return {
+        "service_path": service_path,
+        "status": "on" if is_enabled else "off"
+    }
+# --- Endpoint to get server enabled status --- END
 
 
 # --- Refresh Endpoint --- START
@@ -1821,3 +2370,110 @@ async def websocket_endpoint(websocket: WebSocket):
 #     import uvicorn
 #     # Running this way makes relative paths tricky, better to use uvicorn command from parent
 #     uvicorn.run(app, host="0.0.0.0", port=7860)
+
+# OAuth callback endpoint
+@app.get("/oauth/callback/")
+async def oauth_callback(
+    code: str = None,
+    state: str = None,
+    error: str = None
+):
+    """Handle OAuth authorization callback"""
+    if error:
+        logger.error(f"OAuth authorization error: {error}")
+        return HTMLResponse(
+            content=f"<h1>OAuth Error</h1><p>Authorization failed: {error}</p>",
+            status_code=400
+        )
+    
+    if not code or not state:
+        logger.error("Missing code or state in OAuth callback")
+        return HTMLResponse(
+            content="<h1>OAuth Error</h1><p>Missing authorization code or state</p>",
+            status_code=400
+        )
+    
+    try:
+        server_path = await oauth_manager.exchange_code_for_token(code, state)
+        logger.info(f"OAuth authorization successful for {server_path}")
+        return HTMLResponse(
+            content=f"<h1>OAuth Success</h1><p>Successfully authorized server: {server_path}</p><script>window.close();</script>"
+        )
+    except Exception as e:
+        logger.error(f"OAuth token exchange failed: {e}")
+        return HTMLResponse(
+            content=f"<h1>OAuth Error</h1><p>Token exchange failed: {e}</p>",
+            status_code=400
+        )
+
+# OAuth status endpoint
+@app.get("/api/oauth/status/{service_path:path}")
+async def get_oauth_status(
+    service_path: str,
+    username: Annotated[str, Depends(api_auth)]
+):
+    """Get OAuth status for a service"""
+    if not service_path.startswith('/'):
+        service_path = '/' + service_path
+    
+    return oauth_manager.get_server_oauth_status(service_path)
+
+# OAuth authorization endpoint
+@app.post("/api/oauth/authorize/{service_path:path}")
+async def initiate_oauth_authorization(
+    service_path: str,
+    username: Annotated[str, Depends(api_auth)]
+):
+    """Initiate OAuth authorization for a service"""
+    if not service_path.startswith('/'):
+        service_path = '/' + service_path
+    
+    if not oauth_manager.has_oauth_config(service_path):
+        raise HTTPException(status_code=404, detail="Service does not have OAuth configuration")
+    
+    try:
+        auth_url, state = await oauth_manager.get_authorization_url(service_path)
+        return {
+            "authorization_url": auth_url,
+            "state": state,
+            "message": "Open the authorization URL to complete OAuth flow"
+        }
+    except Exception as e:
+        logger.error(f"Failed to generate authorization URL for {service_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initiate OAuth: {e}")
+
+# OAuth token refresh endpoint
+@app.post("/api/oauth/refresh/{service_path:path}")
+async def refresh_oauth_token(
+    service_path: str,
+    username: Annotated[str, Depends(api_auth)]
+):
+    """Refresh OAuth token for a service"""
+    if not service_path.startswith('/'):
+        service_path = '/' + service_path
+    
+    if not oauth_manager.has_oauth_config(service_path):
+        raise HTTPException(status_code=404, detail="Service does not have OAuth configuration")
+    
+    try:
+        # For client_credentials flow, always get a new token
+        # For authorization_code flow, try to refresh existing token
+        config = oauth_manager._configs[service_path]
+        
+        if config.grant_type == "client_credentials":
+            # Get a new token using client credentials
+            token_info = await oauth_manager.get_client_credentials_token(service_path)
+            return {
+                "message": "Token obtained successfully",
+                "expires_at": token_info.expires_at.isoformat() if token_info.expires_at else None
+            }
+        else:
+            # Try to refresh existing token for authorization_code flow
+            token_info = await oauth_manager.refresh_token(service_path)
+            return {
+                "message": "Token refreshed successfully", 
+                "expires_at": token_info.expires_at.isoformat() if token_info.expires_at else None
+            }
+    except Exception as e:
+        logger.error(f"Failed to refresh/get token for {service_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get token: {e}")
