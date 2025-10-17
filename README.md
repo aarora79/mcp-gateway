@@ -1,11 +1,11 @@
 <img src="registry/static/mcp_gateway_horizontal_white_logo.png" alt="MCP Gateway Logo" width="100%">
 
-# ⚠️ ACTIVE DEVELOPMENT - WORK IN PROGRESS ⚠️
+# PROJECT ARCHIVED - MOVED TO NEW LOCATION
 
-> **WARNING**: This repository is under active development. Expect frequent updates and breaking changes as we improve functionality and refine APIs. We recommend pinning to specific versions for production use. Star the repository to track our progress!
+> **IMPORTANT NOTICE**: This project has moved to [https://github.com/agentic-community/mcp-gateway-registry](https://github.com/agentic-community/mcp-gateway-registry) and is now maintained by the Agentic Community. This repository is now archived and will no longer receive updates. Please use the new repository for the latest features, bug fixes, and active support.
 
-![Under Construction](https://img.shields.io/badge/Status-Under%20Construction-yellow)
-![Stability](https://img.shields.io/badge/API%20Stability-Experimental-orange)
+![Status](https://img.shields.io/badge/Status-Archived-red)
+![New Location](https://img.shields.io/badge/New%20Location-Agentic%20Community-blue)
 
 # MCP Gateway & Registry
 
